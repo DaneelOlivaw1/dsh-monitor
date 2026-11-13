@@ -146,6 +146,20 @@ export function loadSupervisorSkill(root = PACKAGE_ROOT) {
   }
 }
 
+/**
+ * Fingerprint a snapshot for skip decisions.
+ *
+ * The rendered snapshot always carries a timestamp, so comparing raw text would
+ * never match. The time line is the only field that changes when nothing else
+ * does, so it is dropped before the comparison.
+ *
+ * @param snapshot - rendered snapshot text.
+ * @returns the comparison key.
+ */
+export function snapshotFingerprint(snapshot) {
+  return String(snapshot ?? '').replace(/^- 时间：.*$/gm, '').trim()
+}
+
 /** The five fixed lines every tick asks the supervisor for. */
 export const TICK_FORMAT = [
   '裁决：<CONTINUE | INVESTIGATE | PIVOT_PROPOSAL | NO_NEW_EVIDENCE>',
@@ -595,6 +609,16 @@ export function apply(ctx, config) {
     watcher.ticks += 1
     watcher.lastTickAt = Date.now()
     const snapshot = snapshotOf(target)
+    const fingerprint = snapshotFingerprint(snapshot)
+    // A tick with nothing new to say costs a full supervisor turn. When the target
+    // has not moved since the last round, skip the delivery entirely.
+    if (fingerprint === watcher.lastFingerprint) {
+      watcher.skipped += 1
+      writeStatus(statusPath, describe())
+      if (maxTicks > 0 && watcher.ticks >= maxTicks) stopWatcher(watcher.targetId, 'reached maxTicks')
+      return
+    }
+    watcher.lastFingerprint = fingerprint
     watcher.lastSnapshot = snapshot
     const delivered = deliverToSupervisor(
       agentOf(watcher.supervisorId),
@@ -621,6 +645,8 @@ export function apply(ctx, config) {
       lastTickAt: 0,
       ticks: 0,
       lastSnapshot: '',
+      lastFingerprint: undefined,
+      skipped: 0,
       timer: undefined,
       lastInjection: undefined,
     }
@@ -664,6 +690,7 @@ export function apply(ctx, config) {
       supervisorId: watcher.supervisorId,
       everyMinutes: watcher.everyMinutes,
       ticks: watcher.ticks,
+      skipped: watcher.skipped,
       lastTickAt: watcher.lastTickAt === 0 ? '' : new Date(watcher.lastTickAt).toISOString(),
       startedAt: new Date(watcher.startedAt).toISOString(),
       lastInjection: watcher.lastInjection,
@@ -757,7 +784,7 @@ export function apply(ctx, config) {
             text: describe().map(item => [
               `目标：${item.targetId}${item.targetTitle === '' ? '' : `（${item.targetTitle}）`}`,
               `  监督者：${item.supervisorId}`,
-              `  间隔：${item.everyMinutes} 分钟 · 已巡检 ${item.ticks} 次 · 上次 ${item.lastTickAt || '(尚未)'}`,
+              `  间隔：${item.everyMinutes} 分钟 · 已巡检 ${item.ticks} 次（没动静跳过 ${item.skipped} 次） · 上次 ${item.lastTickAt || '(尚未)'}`,
               item.lastInjection === undefined ? '  尚未注入' : `  上次注入：${item.lastInjection.kind} · ${item.lastInjection.reason}`,
             ].join('\n')).join('\n\n'),
           }

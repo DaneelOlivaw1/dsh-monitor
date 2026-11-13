@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { buildTickText, loadSupervisorSkill, parseMonitorCommand, parseSkillDocument, renderSnapshot, TICK_FORMAT } from './index.mjs'
+import { buildTickText, loadSupervisorSkill, parseMonitorCommand, parseSkillDocument, renderSnapshot, snapshotFingerprint, TICK_FORMAT } from './index.mjs'
 
 test('parseMonitorCommand: empty input is usage', () => {
   assert.deepEqual(parseMonitorCommand(''), { action: 'usage' })
@@ -183,4 +183,12 @@ test('buildTickText: names the skill, asks for the five lines, keeps the inject 
   assert.ok(text.includes('/monitor once session-abc 200'))
   assert.ok(text.includes('/monitor inject session-abc'))
   assert.ok(text.includes('unknown tool'))
+})
+
+test('snapshotFingerprint: 只有时间变了的快照算「没动静」', () => {
+  const a = '- 时间：2026-11-14T04:00:00.000Z\n- 状态：running\n- 最近 1 条事件：\n  #1 call bash hi'
+  const b = '- 时间：2026-11-14T04:05:00.000Z\n- 状态：running\n- 最近 1 条事件：\n  #1 call bash hi'
+  const c = '- 时间：2026-11-14T04:05:00.000Z\n- 状态：running\n- 最近 1 条事件：\n  #2 call bash hi'
+  assert.equal(snapshotFingerprint(a), snapshotFingerprint(b))
+  assert.notEqual(snapshotFingerprint(a), snapshotFingerprint(c))
 })

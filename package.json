@@ -1,6 +1,6 @@
 {
   "name": "dsh-monitor",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "DeepSeek Harness bundle plugin: /monitor puts an AI supervisor on another session — timer + snapshots + injection tools, judgement left to the model. Ships a 「派生监管者」 header button that derives a supervisor for the session you are viewing.",
   "type": "module",
   "main": "index.mjs",
