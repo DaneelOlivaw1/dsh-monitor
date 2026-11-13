@@ -613,7 +613,7 @@ export function apply(ctx, config) {
     // A tick with nothing new to say costs a full supervisor turn. When the target
     // has not moved since the last round, skip the delivery entirely.
     if (fingerprint === watcher.lastFingerprint) {
-      watcher.skipped += 1
+      watcher.skipped = (watcher.skipped ?? 0) + 1
       writeStatus(statusPath, describe())
       if (maxTicks > 0 && watcher.ticks >= maxTicks) stopWatcher(watcher.targetId, 'reached maxTicks')
       return
@@ -690,7 +690,7 @@ export function apply(ctx, config) {
       supervisorId: watcher.supervisorId,
       everyMinutes: watcher.everyMinutes,
       ticks: watcher.ticks,
-      skipped: watcher.skipped,
+      skipped: watcher.skipped ?? 0,
       lastTickAt: watcher.lastTickAt === 0 ? '' : new Date(watcher.lastTickAt).toISOString(),
       startedAt: new Date(watcher.startedAt).toISOString(),
       lastInjection: watcher.lastInjection,

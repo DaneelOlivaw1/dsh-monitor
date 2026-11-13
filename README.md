@@ -63,6 +63,13 @@ already said, and says that a failure shape seen a third time becomes a gate
 | live watchers | `$DSH_HOME/monitor/status.json` |
 | retrospective notes | `<target cwd>/memory/pitfalls/auto-monitor.md` |
 
+## Development
+
+The Harness reloads plugin source while it runs (`@deepseek-ai/dsh-hmr` watches the
+package), so a change to `index.mjs` takes effect without restarting `dsh web`; a
+change under `client/` needs a page refresh in the browser. Only dependency
+installs, a port/instance change, or a new package entry need a real restart.
+
 ## Test
 
 ```bash
