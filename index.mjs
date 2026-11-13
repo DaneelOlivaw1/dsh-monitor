@@ -162,11 +162,20 @@ export function snapshotFingerprint(snapshot) {
 
 /** The five fixed lines every tick asks the supervisor for. */
 export const TICK_FORMAT = [
-  '裁决：<CONTINUE | INVESTIGATE | PIVOT_PROPOSAL | NO_NEW_EVIDENCE>',
-  '前提：<它在验的那句话>',
-  '证据：<文件:行 / 命令输出行 / 库行；没有就写「无新增」>',
-  '理由：<一句话，为什么是这个裁决>',
-  '下一轮盯：<下一轮该看什么变了没有>',
+  '**裁决** CONTINUE | INVESTIGATE | PIVOT_PROPOSAL | NO_NEW_EVIDENCE',
+  '',
+  '**前提**',
+  '<一句话：它在验什么>',
+  '',
+  '**证据**',
+  '- <指针> → <一句话说明>',
+  '- <指针> → <一句话说明>',
+  '',
+  '**理由**',
+  '<一句话：为什么是这个裁决>',
+  '',
+  '**下一轮盯**',
+  '<一句话：下一轮看什么变了没有>',
 ]
 
 /**
@@ -184,7 +193,7 @@ export function buildTickText({ tick, everyMinutes, snapshot, targetId, skill = 
     '',
     snapshot,
     '',
-    `按 \`${skill}\` 技能判断，只回下面五行，不要写别的：`,
+    `按 \`${skill}\` 技能判断，严格按下面模板输出（字段各占一行、块与块之间空一行，不要把字段挤成一段）：`,
     ...TICK_FORMAT,
     '',
     '快照已经在上面了，不用再拉一次。要看更多 / 要说话，各两条路：',
@@ -196,6 +205,7 @@ export function buildTickText({ tick, everyMinutes, snapshot, targetId, skill = 
     '- 不需要介入：裁决写 CONTINUE 或 NO_NEW_EVIDENCE，然后继续你手上的事。',
     '- 同一形态第 3 次出现：不要注入第 3 遍，改提议一条闸门（.dsh/gates.yml）并写进台账。',
     '- 你是监督者，不要替目标干活；注入要具体（点名命令/文件/下一步动作）。',
+    '- 每块最多两句；证据 2–4 条，一条一个指针；没有新增就写「无新增」。',
   ].join('\n')
 }
 

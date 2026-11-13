@@ -175,7 +175,12 @@ test('buildTickText: names the skill, asks for the five lines, keeps the inject 
     targetId: 'session-abc',
   })
   assert.ok(text.includes('`monitor-supervisor`'))
-  for (const line of TICK_FORMAT) assert.ok(text.includes(line.split('<')[0]), `tick text must ask for ${line}`)
+  for (const label of ['**裁决**', '**前提**', '**证据**', '**理由**', '**下一轮盯**']) {
+    assert.ok(text.includes(label), `tick text must ask for ${label}`)
+  }
+  // 排版是这次修复的重点：模板必须是分行的，挤成一段就说明退回去了
+  assert.ok(TICK_FORMAT.includes(''), '模板必须留空行分块')
+  assert.ok(TICK_FORMAT.some((line) => line.startsWith('- ')), '证据必须是列表项')
   assert.ok(text.includes('session_id="session-abc"'))
   assert.ok(text.includes('monitor_inject'))
   assert.ok(text.includes('第 3 次'))
