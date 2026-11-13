@@ -173,9 +173,12 @@ export function buildTickText({ tick, everyMinutes, snapshot, targetId, skill = 
     `按 \`${skill}\` 技能判断，只回下面五行，不要写别的：`,
     ...TICK_FORMAT,
     '',
-    `- 要介入：调用 monitor_inject，session_id="${targetId}"，text=你要对目标说的话，`,
-    '  reason=判断依据（哪几条证据让你认为它卡了），kind=stuck|off_track|needs_context|idle。',
-    `- 要看更多：调用 monitor_snapshot，session_id="${targetId}"，limit 调大。`,
+    '快照已经在上面了，不用再拉一次。要看更多 / 要说话，各两条路：',
+    `- 看更多：优先 monitor_snapshot（session_id="${targetId}"，limit 调大）；`,
+    `  工具报 unknown tool 就改用命令 /monitor once ${targetId} 200，不要重试工具。`,
+    `- 要介入：优先 monitor_inject（session_id="${targetId}"，text=你要对目标说的话，`,
+    '  reason=判断依据，kind=stuck|off_track|needs_context|idle）；',
+    `  工具报 unknown tool 就改用命令 /monitor inject ${targetId} <你要说的话>。`,
     '- 不需要介入：裁决写 CONTINUE 或 NO_NEW_EVIDENCE，然后继续你手上的事。',
     '- 同一形态第 3 次出现：不要注入第 3 遍，改提议一条闸门（.dsh/gates.yml）并写进台账。',
     '- 你是监督者，不要替目标干活；注入要具体（点名命令/文件/下一步动作）。',
@@ -205,7 +208,11 @@ export function parseMonitorCommand(raw) {
   if (head === 'status' || head === 'list') return { action: 'status' }
   if (head === 'stop') return { action: 'stop', sessionId: tokens[1] ?? 'all' }
   if (head === 'once' || head === 'tick' || head === 'now') {
-    return { action: 'once', sessionId: tokens[1] ?? 'latest' }
+    const limit = Number(tokens[2])
+    const action = { action: 'once', sessionId: tokens[1] ?? 'latest' }
+    // A third token asks for a deeper snapshot; without one the plugin setting wins.
+    if (Number.isFinite(limit) && limit > 0) action.limit = Math.trunc(limit)
+    return action
   }
   if (head === 'inject') {
     return { action: 'inject', sessionId: tokens[1] ?? 'latest', text: tokens.slice(2).join(' ') }
@@ -764,7 +771,7 @@ export function apply(ctx, config) {
         if (parsed.action === 'once') {
           const target = resolveTarget(parsed.sessionId, invocation.agent)
           if (target === undefined) return { kind: 'error', text: `找不到会话 ${parsed.sessionId}。` }
-          return { kind: 'success', text: snapshotOf(target) }
+          return { kind: 'success', text: snapshotOf(target, parsed.limit ?? snapshotLimit) }
         }
         if (parsed.action === 'inject') {
           const target = resolveTarget(parsed.sessionId, invocation.agent)

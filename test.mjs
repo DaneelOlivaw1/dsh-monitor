@@ -13,6 +13,13 @@ test('parseMonitorCommand: subcommands', () => {
   assert.deepEqual(parseMonitorCommand('stop'), { action: 'stop', sessionId: 'all' })
   assert.deepEqual(parseMonitorCommand('stop session-abc'), { action: 'stop', sessionId: 'session-abc' })
   assert.deepEqual(parseMonitorCommand('once'), { action: 'once', sessionId: 'latest' })
+  assert.deepEqual(parseMonitorCommand('once session-abc 200'), {
+    action: 'once',
+    sessionId: 'session-abc',
+    limit: 200,
+  })
+  // 非法条数不产生字段，退化成默认设置
+  assert.deepEqual(parseMonitorCommand('once session-abc abc'), { action: 'once', sessionId: 'session-abc' })
   assert.deepEqual(parseMonitorCommand('once session-abc'), { action: 'once', sessionId: 'session-abc' })
   assert.deepEqual(parseMonitorCommand('inject session-abc 别再重跑 这条测试'), {
     action: 'inject',
@@ -172,4 +179,8 @@ test('buildTickText: names the skill, asks for the five lines, keeps the inject 
   assert.ok(text.includes('session_id="session-abc"'))
   assert.ok(text.includes('monitor_inject'))
   assert.ok(text.includes('第 3 次'))
+  // 工具在旧会话里可能已失效：提示词必须给出命令那条退路，否则监督者会卡在报错上
+  assert.ok(text.includes('/monitor once session-abc 200'))
+  assert.ok(text.includes('/monitor inject session-abc'))
+  assert.ok(text.includes('unknown tool'))
 })
