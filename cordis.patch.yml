@@ -1,0 +1,15 @@
+# dsh-monitor — bundle patch.
+#
+# Mounts the plugin module from this package. Text, thresholds and file paths all
+# live in the row config below or on the settings page: every Config field is
+# `.volatile()`, so the settings service derives the form from the schema.
+- insert:
+    - id: monitor
+      name: dsh-monitor
+      config:
+        # `/monitor` 未指定间隔时用这个值（分钟）。
+        defaultEveryMinutes: 5
+        # 一次快照里带多少条最近事件；判断打转通常 30–60 条就够。
+        snapshotLimit: 40
+        # 复盘落点；相对于目标会话的工作目录。
+        pitfallsPath: memory/pitfalls/auto-monitor.md
