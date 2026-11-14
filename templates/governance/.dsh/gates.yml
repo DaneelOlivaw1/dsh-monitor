@@ -1,0 +1,63 @@
+# 闸门定义。跟着项目走，进 git。
+#
+# 每条只写「必要条件」：能数、能 grep、能跑脚本的。需要判断力的别放进来。
+# enforce: block（不满足就拦下一次动作） | warn（只提示，不拦）
+#
+# 插件（dsh-monitor 的闸门引擎）读这个文件；监督者可以加/改/提速，
+# 删闸门和放松判据必须带证据并留痕到 .dsh/gates-ledger.jsonl。
+version: 1
+
+loop:
+  # 时钟巡检间隔（分钟）。监督者判断「在推进 / 打转 / 假完成」。
+  everyMinutes: 5
+  # 没新动静时只比指纹、不唤醒模型，所以默认永不停机。
+  idleRoundsBeforeStop: 0
+
+gates:
+  - id: plan-before-code
+    when: 第一次改代码之前
+    require: 存在 plans/NNNN-*/task_plan.md，且含「验收」段
+    enforce: block
+    message: 先写计划（plans/NNNN-YYYY-MM-DD-标题/task_plan.md），含验收标准再动手。
+
+  - id: test-red-first
+    when: 改源码之前
+    require: 有一次测试运行失败（退出码≠0）的记录，且早于第一个源码改动
+    enforce: block
+    message: 先让测试红一次再改实现——没红过的测试证明不了什么。
+
+  - id: scope-only-planned-files
+    when: 每次改文件
+    require: 改动文件在 task_plan 的「涉及文件」里
+    enforce: warn
+    message: 这个文件不在计划里；要么补进计划，要么说明为什么必须动它。
+
+  - id: review-pass-before-merge
+    when: 合并 / 交任务
+    require: reviewer 报告最后一行是 PASS
+    enforce: block
+    message: 没有 PASS 的评审报告，不许合并。
+
+  - id: no-empty-report
+    when: 子代理运行结束
+    require: 报告文件存在且非空，含该角色交付格式的字段
+    enforce: block
+    message: 报告为空 = 早退，整轮重派。
+
+  - id: deliver-with-evidence
+    when: 声称「完成 / 修好 / 上线」
+    require: L1 界面证据 + L3 库行证据同时存在，且带指针（文件:行 / 命令输出 / 库行）
+    enforce: block
+    message: 只有接口返回（L2）不算完成，补界面与库行证据。
+
+  - id: ledger-sync
+    when: 改了 memory/constraints 覆盖的文件
+    require: 同轮更新了对应台账条目
+    enforce: warn
+    message: 台账没跟着改，下次重构就会悄悄改回去。
+
+  - id: third-time-becomes-gate
+    when: 同一形态的裁决第 3 次出现
+    require: 已落台账条目，或已提议一条闸门
+    enforce: block
+    message: 第三次不是再说一遍，是升级成闸门或写进台账。

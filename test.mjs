@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict'
+import { existsSync, readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
 import { buildTickText, DEFAULT_IDLE_ROUNDS, evidenceProblems, maxEventId, loadSupervisorSkill, parseMonitorCommand, parseSkillDocument, renderSnapshot, snapshotFingerprint, TICK_FORMAT } from './index.mjs'
 
@@ -224,4 +227,22 @@ test('evidenceProblems: 复述旧事件、指针解析不开都要被挡', () =>
   assert.ok(evidenceProblems({ snapshot, lastEventId: 9, evidence: ['完全不存在的一句话'] }).length > 0)
   // 空证据
   assert.ok(evidenceProblems({ snapshot, lastEventId: 9, evidence: [''] }).length > 0)
+})
+
+test('治理模板：角色/流程/台账/闸门都在', () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), 'templates', 'governance')
+  const need = [
+    'AGENTS.md', 'README.md', '.dsh/gates.yml',
+    'agents/developer.md', 'agents/test-runner.md', 'agents/reviewer.md',
+    'agents/deploy-ops.md', 'agents/data-analyst.md',
+    'docs/dev-flow.md', 'docs/dispatch-protocol.md', 'docs/ledger-standard.md', 'docs/project-rules.md',
+    'memory/MEMORY.md', 'memory/TEMPLATE.md',
+  ]
+  for (const rel of need) assert.ok(existsSync(join(root, rel)), `模板缺 ${rel}`)
+  const gates = readFileSync(join(root, '.dsh', 'gates.yml'), 'utf8')
+  for (const id of ['plan-before-code', 'test-red-first', 'review-pass-before-merge', 'no-empty-report', 'deliver-with-evidence', 'ledger-sync', 'third-time-becomes-gate']) {
+    assert.ok(gates.includes(`id: ${id}`), `闸门缺 ${id}`)
+  }
+  // deliver-with-evidence 必须同时要 L1 与 L3，只有接口返回不算完成
+  assert.ok(gates.includes('L1') && gates.includes('L3'))
 })

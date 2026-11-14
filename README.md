@@ -46,6 +46,21 @@ skill at boot and named by every tick. It fixes four verdicts —
 already said, and says that a failure shape seen a third time becomes a gate
 (`.dsh/gates.yml`) instead of a third injection.
 
+## Project governance template
+
+`templates/governance/` is a framework-agnostic skeleton for a project's agent
+workflow, in four layers: **roles** (`agents/*.md`), **process**
+(`docs/dev-flow.md`), **gates** (`.dsh/gates.yml`), and **ledger** (`memory/`).
+
+```bash
+bash scripts/init-governance.sh /path/to/project
+```
+
+Each gate states a *necessary* condition only — something a program can count,
+grep, or run — because a sufficient condition needs judgement and misfires.
+`/monitor` supervises the same loop: the clock decides when to look, the gates
+decide what counts as finished.
+
 ## Files
 
 | path | role |
@@ -54,6 +69,8 @@ already said, and says that a failure shape seen a third time becomes a gate
 | `client/client.js` | browser half: the 「派生监管者」 header button |
 | `skills/monitor-supervisor/SKILL.md` | the judgement method |
 | `cordis.patch.yml` | bundle patch with the default config |
+| `templates/governance/` | project governance skeleton (roles / process / gates / ledger) |
+| `scripts/init-governance.sh` | copy that skeleton into a project without overwriting |
 
 ## Runtime data
 
