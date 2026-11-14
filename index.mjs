@@ -176,6 +176,61 @@ export function snapshotFingerprint(snapshot) {
 }
 
 // reload-probe-marker: 内容改动用于确认面板是否热重载（确认后可删）
+/** Event ids the snapshot renders as `#123`. */
+const EVENT_ID = /#(\d+)/g
+
+/**
+ * Highest event id in a rendered snapshot, or 0 when it carries none.
+ * @param snapshot - rendered snapshot text.
+ * @returns the largest `#id` seen.
+ */
+export function maxEventId(snapshot) {
+  let highest = 0
+  for (const match of String(snapshot ?? '').matchAll(EVENT_ID)) {
+    const id = Number(match[1])
+    if (Number.isFinite(id) && id > highest) highest = id
+  }
+  return highest
+}
+
+/**
+ * Check that each evidence pointer actually resolves.
+ *
+ * This is the gate that keeps a status recap out: a recap cites either nothing or
+ * events from before the last round, and both fail here without any judgement
+ * about prose quality.
+ *
+ * @param options - snapshot text, last delivered event id, and the pointers.
+ * @returns one problem string per pointer that does not resolve; empty when clean.
+ */
+export function evidenceProblems({ snapshot, lastEventId = 0, evidence = [] }) {
+  const problems = []
+  const text = String(snapshot ?? '')
+  const cited = new Set()
+  for (const raw of evidence) {
+    const pointer = String(raw ?? '').trim()
+    if (pointer === '') {
+      problems.push('空的证据项')
+      continue
+    }
+    const ids = [...pointer.matchAll(EVENT_ID)].map(match => Number(match[1])).filter(Number.isFinite)
+    if (ids.length > 0) {
+      const missing = ids.filter(id => !text.includes(`#${id}`))
+      if (missing.length > 0) problems.push(`#${missing.join('/#')} 不在本轮快照里`)
+      const stale = ids.filter(id => id <= lastEventId)
+      if (stale.length > 0) problems.push(`#${stale.join('/#')} 是上一轮之前的事件（复述，不是新增）`)
+      for (const id of ids) cited.add(id)
+      continue
+    }
+    // A bare pointer has to appear literally in the snapshot it claims to quote.
+    if (!text.includes(pointer)) problems.push(`「${pointer.slice(0, 40)}」在本轮快照里找不到`)
+  }
+  if (lastEventId > 0 && cited.size > 0 && [...cited].every(id => id <= lastEventId)) {
+    problems.push('引用的全是上一轮之前的旧事件')
+  }
+  return problems
+}
+
 /** The five fixed lines every tick asks the supervisor for. */
 export const TICK_FORMAT = [
   '**裁决** CONTINUE | INVESTIGATE | PIVOT_PROPOSAL | NO_NEW_EVIDENCE',
@@ -725,6 +780,7 @@ export function apply(ctx, config) {
     }
     watcher.lastFingerprint = fingerprint
     watcher.lastSnapshot = snapshot
+    watcher.lastEventId = maxEventId(snapshot)
     const delivered = deliverToSupervisor(
       agentOf(watcher.supervisorId),
       tickText(watcher, watcher.ticks, snapshot),
@@ -733,18 +789,20 @@ export function apply(ctx, config) {
     if (maxTicks > 0 && watcher.ticks >= maxTicks) stopWatcher(watcher.targetId, 'reached maxTicks')
     writeStatus(statusPath, describe(), INSTANCE_ID)
     if (!delivered) {
-      // The supervisor is gone; stop rather than ticking into the void.
-      stopWatcher(watcher.targetId, 'supervisor offline')
+      // The supervisor session is closed, not gone: re-opening it resumes delivery.
+      // Keep the watcher armed so monitoring survives restarts and page reloads.
+      watcher.supervisorMissed = (watcher.supervisorMissed ?? 0) + 1
+      writeStatus(statusPath, describe(), INSTANCE_ID)
     }
   }
 
   /** Start (or restart) one watcher. */
-  function startWatcher(target, supervisor, everyMinutes) {
+  function startWatcher(target, supervisor, everyMinutes, explicitSupervisorId) {
     stopWatcher(target.id, 'restarted', { silent: true })
     const watcher = {
       targetId: target.id,
       targetTitle: oneLine(target.session?.title ?? '', 60),
-      supervisorId: supervisor?.id ?? '',
+      supervisorId: supervisor?.id ?? explicitSupervisorId ?? '',
       everyMinutes,
       startedAt: Date.now(),
       lastTickAt: 0,
@@ -796,6 +854,7 @@ export function apply(ctx, config) {
       everyMinutes: watcher.everyMinutes,
       ticks: watcher.ticks,
       skipped: watcher.skipped ?? 0,
+      supervisorMissed: watcher.supervisorMissed ?? 0,
       lastTickAt: watcher.lastTickAt === 0 ? '' : new Date(watcher.lastTickAt).toISOString(),
       startedAt: new Date(watcher.startedAt).toISOString(),
       lastInjection: watcher.lastInjection,
@@ -964,6 +1023,112 @@ export function apply(ctx, config) {
         ? Math.trunc(Number(args?.limit))
         : snapshotLimit
       return snapshotOf(target, limit)
+    },
+  })
+
+  // The verdict gate. The report only counts when it arrives here, because this is
+  // the one place the program can check that the pointers resolve and are newer
+  // than the last delivered round. A status recap cites nothing (or old ids) and
+  // fails without anyone judging the prose.
+  ctx.tools.register({
+    name: 'monitor_verdict',
+    description: 'Submit this round\'s supervision verdict. The plugin checks the evidence pointers: each must resolve inside the current snapshot and cite events newer than the previous round. Two failed attempts auto-downgrade the verdict to NO_NEW_EVIDENCE.',
+    parameters: {
+      type: 'object',
+      properties: {
+        target: { type: 'string', description: 'Watched session id.' },
+        verdict: {
+          type: 'string',
+          enum: ['CONTINUE', 'INVESTIGATE', 'PIVOT_PROPOSAL', 'NO_NEW_EVIDENCE'],
+          description: 'CONTINUE keeps going; INVESTIGATE needs one more piece of evidence; PIVOT_PROPOSAL suggests changing direction; NO_NEW_EVIDENCE means say nothing new.',
+        },
+        premise: { type: 'string', description: 'The falsifiable claim the target is testing (one sentence).' },
+        evidence: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Pointers: #eventId, `file:line`, or a literal line from the snapshot. Empty only for NO_NEW_EVIDENCE.',
+        },
+        reason: { type: 'string', description: 'One sentence: which criterion decided this verdict.' },
+        next_watch: { type: 'string', description: 'One sentence: what to look at next round.' },
+      },
+      required: ['target', 'verdict', 'premise', 'evidence', 'reason', 'next_watch'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: String(value ?? '') }],
+    },
+    execute: (args) => {
+      const targetId = String(args?.target ?? '')
+      const watcher = watchers.get(targetId)
+      const verdict = String(args?.verdict ?? '').toUpperCase()
+      const allowed = ['CONTINUE', 'INVESTIGATE', 'PIVOT_PROPOSAL', 'NO_NEW_EVIDENCE']
+      if (!allowed.includes(verdict)) return `裁决只能是 ${allowed.join(' / ')}，收到「${verdict}」。`
+      const evidence = Array.isArray(args?.evidence) ? args.evidence.map(String) : []
+      const premise = String(args?.premise ?? '').trim()
+      const reason = String(args?.reason ?? '').trim()
+      const nextWatch = String(args?.next_watch ?? '').trim()
+      const fingerprint = `${premise}|${evidence.join('|')}`
+
+      const record = (finalVerdict, note) => {
+        appendReceipt(receiptsPath, {
+          at: new Date().toISOString(),
+          event: 'verdict',
+          target: targetId,
+          verdict: finalVerdict,
+          premise,
+          evidence,
+          reason,
+          nextWatch,
+          note,
+        })
+        return `已记录裁决 ${finalVerdict}（${evidence.length} 条证据）${note === undefined ? '' : `：${note}`}`
+      }
+
+      if (verdict === 'NO_NEW_EVIDENCE') {
+        if (watcher !== undefined) {
+          watcher.lastVerdict = verdict
+          watcher.verdictAttempts = 0
+        }
+        return record(verdict)
+      }
+
+      // Same premise and same evidence as the last accepted verdict: a second
+      // telling of one finding, which is exactly the noise this plugin exists to cut.
+      if (watcher !== undefined && watcher.lastVerdictFingerprint === fingerprint) {
+        return record('NO_NEW_EVIDENCE', '与上一轮裁决同前提同证据')
+      }
+
+      const problems = []
+      if (premise === '') problems.push('前提是空的')
+      if (reason === '') problems.push('理由是空的')
+      if (nextWatch === '') problems.push('「下一轮盯」是空的')
+      if (evidence.length === 0) problems.push('证据为空；没有新增就判 NO_NEW_EVIDENCE')
+      problems.push(...evidenceProblems({
+        snapshot: watcher?.lastSnapshot ?? '',
+        lastEventId: watcher?.lastEventId ?? 0,
+        evidence,
+      }))
+
+      if (problems.length > 0) {
+        const attempts = (watcher?.verdictAttempts ?? 0) + 1
+        if (watcher !== undefined) watcher.verdictAttempts = attempts
+        if (attempts >= 2) {
+          if (watcher !== undefined) {
+            watcher.verdictAttempts = 0
+            watcher.lastVerdict = 'NO_NEW_EVIDENCE'
+          }
+          return record('NO_NEW_EVIDENCE', `连续两次不合格：${problems.join('；')}`)
+        }
+        return `证据不成立，改完再提交：${problems.join('；')}`
+      }
+
+      if (watcher !== undefined) {
+        watcher.verdictAttempts = 0
+        watcher.lastVerdict = verdict
+        watcher.lastVerdictFingerprint = fingerprint
+      }
+      return record(verdict)
     },
   })
 
@@ -1201,11 +1366,18 @@ export function apply(ctx, config) {
         pendingArm.delete(targetId)
         continue
       }
+      // Only the watched session has to be live. The supervisor may be closed
+      // right now (restart, page reload): keep watching and deliver once it opens,
+      // instead of dropping the watcher because nobody is listening yet.
       const target = agentOf(targetId)
-      const supervisor = agentOf(entry.supervisorId)
-      if (target === undefined || supervisor === undefined) continue
+      if (target === undefined) continue
       pendingArm.delete(targetId)
-      startWatcher(target, supervisor, Number(entry.everyMinutes) > 0 ? Number(entry.everyMinutes) : defaultEveryMinutes)
+      startWatcher(
+        target,
+        agentOf(entry.supervisorId),
+        Number(entry.everyMinutes) > 0 ? Number(entry.everyMinutes) : defaultEveryMinutes,
+        entry.supervisorId,
+      )
     }
   }
 

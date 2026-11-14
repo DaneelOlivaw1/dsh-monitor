@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { buildTickText, DEFAULT_IDLE_ROUNDS, loadSupervisorSkill, parseMonitorCommand, parseSkillDocument, renderSnapshot, snapshotFingerprint, TICK_FORMAT } from './index.mjs'
+import { buildTickText, DEFAULT_IDLE_ROUNDS, evidenceProblems, maxEventId, loadSupervisorSkill, parseMonitorCommand, parseSkillDocument, renderSnapshot, snapshotFingerprint, TICK_FORMAT } from './index.mjs'
 
 test('parseMonitorCommand: empty input is usage', () => {
   assert.deepEqual(parseMonitorCommand(''), { action: 'usage' })
@@ -205,4 +205,23 @@ test('snapshotFingerprint: 只有时间变了的快照算「没动静」', () =>
   const c = '- 时间：2026-11-14T04:05:00.000Z\n- 状态：running\n- 最近 1 条事件：\n  #2 call bash hi'
   assert.equal(snapshotFingerprint(a), snapshotFingerprint(b))
   assert.notEqual(snapshotFingerprint(a), snapshotFingerprint(c))
+})
+
+test('maxEventId: 取快照里最大的事件号', () => {
+  assert.equal(maxEventId('a #3 b #12 c'), 12)
+  assert.equal(maxEventId('没有事件号'), 0)
+})
+
+test('evidenceProblems: 复述旧事件、指针解析不开都要被挡', () => {
+  const snapshot = '- 最近事件：\n  #10 call bash\n  #11 result ok'
+  // 新事件 + 可解析 → 干净
+  assert.deepEqual(evidenceProblems({ snapshot, lastEventId: 9, evidence: ['#11 → ok'] }), [])
+  // 旧事件（<= 上轮最大号）= 复述
+  assert.ok(evidenceProblems({ snapshot, lastEventId: 11, evidence: ['#10 → 旧'] }).some((p) => p.includes('上一轮之前')))
+  // 快照里没有这个号
+  assert.ok(evidenceProblems({ snapshot, lastEventId: 9, evidence: ['#99 → 不存在'] }).some((p) => p.includes('不在本轮快照')))
+  // 裸指针找不到原文
+  assert.ok(evidenceProblems({ snapshot, lastEventId: 9, evidence: ['完全不存在的一句话'] }).length > 0)
+  // 空证据
+  assert.ok(evidenceProblems({ snapshot, lastEventId: 9, evidence: [''] }).length > 0)
 })
