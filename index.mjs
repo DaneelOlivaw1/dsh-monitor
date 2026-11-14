@@ -48,6 +48,15 @@ export const SOURCE_KIND = 'monitor'
 /** Default interval between supervision ticks. */
 export const DEFAULT_EVERY_MINUTES = 5
 
+/**
+ * Consecutive no-change rounds before a watcher stops itself. 0 = never.
+ *
+ * Skipping compares fingerprints; it does not call the model. A silent target
+ * therefore costs nothing to keep watching, and stopping would miss the round
+ * where it starts moving again.
+ */
+export const DEFAULT_IDLE_ROUNDS = 0
+
 /** Package root, used to locate the bundled supervisor skill. */
 const PACKAGE_ROOT = dirname(fileURLToPath(import.meta.url))
 
@@ -88,6 +97,12 @@ export const Config = z.object({
   receiptsPath: z.string().default('').volatile(),
   /** Live watcher status file; defaults to `$DSH_HOME/monitor/status.json`. */
   statusPath: z.string().default('').volatile(),
+  /**
+   * Consecutive no-change rounds before the watcher stops itself; 0 keeps it running.
+   * Skipping is a fingerprint comparison, not a model turn, so watching a silent
+   * session costs nothing — stopping by default only loses the moment it speaks.
+   */
+  idleRoundsBeforeStop: z.number().step(1).min(0).default(DEFAULT_IDLE_ROUNDS).volatile(),
   /** Retrospective Markdown appended on a real intervention; empty disables it. */
   pitfallsPath: z.string().default('memory/pitfalls/auto-monitor.md').volatile(),
 })
@@ -160,22 +175,30 @@ export function snapshotFingerprint(snapshot) {
   return String(snapshot ?? '').replace(/^- 时间：.*$/gm, '').trim()
 }
 
+// reload-probe-marker: 内容改动用于确认面板是否热重载（确认后可删）
 /** The five fixed lines every tick asks the supervisor for. */
 export const TICK_FORMAT = [
   '**裁决** CONTINUE | INVESTIGATE | PIVOT_PROPOSAL | NO_NEW_EVIDENCE',
   '',
   '**前提**',
-  '<一句话：它在验什么>',
+  '<一句话：可以被证伪的判断，不是「它正在做什么」>',
   '',
   '**证据**',
-  '- <指针> → <一句话说明>',
-  '- <指针> → <一句话说明>',
+  '- <指针> → <这条新证据说明什么>',
+  '- <指针> → <这条新证据说明什么>',
   '',
   '**理由**',
-  '<一句话：为什么是这个裁决>',
+  '<一句话：哪条判据决定了这个裁决>',
   '',
   '**下一轮盯**',
   '<一句话：下一轮看什么变了没有>',
+]
+
+/** Rules that keep the report a judgement instead of a status recap. */
+export const TICK_RULES = [
+  '- 不要复述目标在做什么，那是状态总结，不是判断。前提写的是断言，证据只列上一轮之后新增的。',
+  '- 没有新增证据：只回 `**裁决** NO_NEW_EVIDENCE` 和一行理由，其余不要写。',
+  '- 每块最多两句；证据 2–4 条，一条一个指针；不用表格。',
 ]
 
 /**
@@ -187,14 +210,19 @@ export const TICK_FORMAT = [
  * @param options - tick number, interval, snapshot text, and the watched session.
  * @returns the message the supervisor receives.
  */
-export function buildTickText({ tick, everyMinutes, snapshot, targetId, skill = SUPERVISOR_SKILL }) {
+export function buildTickText({ tick, everyMinutes, snapshot, targetId, lastRound, skill = SUPERVISOR_SKILL }) {
   return [
     `（monitor 巡检 · 第 ${tick} 次 · 每 ${everyMinutes} 分钟）`,
     '',
     snapshot,
     '',
+    ...(typeof lastRound === 'string' && lastRound.trim() !== ''
+      ? [`上一轮：${lastRound.trim()}（同一结论不要再说一遍）`, '']
+      : []),
     `按 \`${skill}\` 技能判断，严格按下面模板输出（字段各占一行、块与块之间空一行，不要把字段挤成一段）：`,
     ...TICK_FORMAT,
+    '',
+    ...TICK_RULES,
     '',
     '快照已经在上面了，不用再拉一次。要看更多 / 要说话，各两条路：',
     `- 看更多：优先 monitor_snapshot（session_id="${targetId}"，limit 调大）；`,
@@ -437,12 +465,13 @@ function safeTurnBoundary(agent) {
 }
 
 /** Write the live watcher status file (atomic, never throws). */
-function writeStatus(path, watchers) {
+function writeStatus(path, watchers, owner) {
   try {
     const body = JSON.stringify({
       version: 1,
       plugin: name,
       updatedAt: new Date().toISOString(),
+      owner: owner ?? '',
       watchers,
     }, null, 2)
     mkdirSync(dirname(path), { recursive: true })
@@ -455,6 +484,34 @@ function writeStatus(path, watchers) {
 }
 
 /** Append one JSON receipt line (never throws). */
+/**
+ * Read the instance that currently owns the timers, if the file names one.
+ * @param path - status file.
+ * @returns the owner id, or undefined when the file is missing or has none.
+ */
+function readStatusOwner(path) {
+  try {
+    const owner = JSON.parse(readFileSync(path, 'utf8'))?.owner
+    return typeof owner === 'string' && owner !== '' ? owner : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Read the persisted watcher list, tolerating a missing or corrupt file.
+ * @param path - status file.
+ * @returns the persisted watcher entries, or an empty list.
+ */
+function readStatusWatchers(path) {
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8'))
+    return Array.isArray(parsed?.watchers) ? parsed.watchers : []
+  } catch {
+    return []
+  }
+}
+
 function appendReceipt(path, record) {
   try {
     mkdirSync(dirname(path), { recursive: true })
@@ -501,12 +558,25 @@ export function apply(ctx, config) {
   const maxTicks = Math.max(0, Math.trunc(Number(read(config.maxTicks, 0))))
   const receiptsSetting = String(read(config.receiptsPath, ''))
   const statusSetting = String(read(config.statusPath, ''))
+  const idleRoundsBeforeStop = Math.max(0, Math.trunc(Number(read(config.idleRoundsBeforeStop, DEFAULT_IDLE_ROUNDS))))
   const pitfallsSetting = String(read(config.pitfallsPath, 'memory/pitfalls/auto-monitor.md'))
   const receiptsPath = receiptsSetting === '' ? join(dshHome(), 'monitor', 'receipts.jsonl') : receiptsSetting
   const statusPath = statusSetting === '' ? join(dshHome(), 'monitor', 'status.json') : statusSetting
 
   /** targetSessionId → watcher. */
   const watchers = new Map()
+  // Two dsh instances can share one profile; without an owner only one of them
+  // should drive the timers, or one target gets two ticks per interval.
+  const INSTANCE_ID = randomUUID()
+  // One line per plugin load. Without it, "did the panel reload my change?" is a
+  // guess; with it, the receipts file answers by counting.
+  appendReceipt(receiptsPath, {
+    at: new Date().toISOString(),
+    event: 'apply',
+    pid: process.pid,
+    instance: INSTANCE_ID,
+    code: 'skip+autoStop+owner',
+  })
   /** Recently seen agents, for `latest` and for liveness checks. */
   const known = new Map()
 
@@ -600,12 +670,23 @@ export function apply(ctx, config) {
       everyMinutes: watcher.everyMinutes,
       snapshot,
       targetId: watcher.targetId,
+      lastRound: watcher.lastInjection === undefined
+        ? undefined
+        : `${watcher.lastInjection.kind} · ${watcher.lastInjection.reason}`,
     })
   }
 
   /** Run one supervision tick for one watcher. */
   function tick(watcher) {
     if (!enabled) return
+    const owner = readStatusOwner(statusPath)
+    if (owner !== undefined && owner !== INSTANCE_ID) {
+      // Another live instance owns the timers. Stand down without writing, so the
+      // owner's status file keeps the record instead of being overwritten.
+      if (watcher.timer !== undefined) clearInterval(watcher.timer)
+      watchers.delete(watcher.targetId)
+      return
+    }
     const target = agentOf(watcher.targetId)
     if (target === undefined) {
       deliverToSupervisor(
@@ -624,7 +705,21 @@ export function apply(ctx, config) {
     // has not moved since the last round, skip the delivery entirely.
     if (fingerprint === watcher.lastFingerprint) {
       watcher.skipped = (watcher.skipped ?? 0) + 1
-      writeStatus(statusPath, describe())
+      // A supervisor that keeps waking up over a silent target is paying for nothing;
+      // a skip is free, so by default the watcher keeps watching. Setting the config
+      // above to a positive number opts into stopping after that many quiet rounds.
+      if (idleRoundsBeforeStop > 0 && watcher.skipped >= idleRoundsBeforeStop) {
+        appendReceipt(receiptsPath, {
+          at: new Date().toISOString(),
+          event: 'stop',
+          target: watcher.targetId,
+          supervisor: watcher.supervisorId,
+          reason: `连续 ${watcher.skipped} 轮没有新动静，自动停`,
+        })
+        stopWatcher(watcher.targetId, 'idle')
+        return
+      }
+      writeStatus(statusPath, describe(), INSTANCE_ID)
       if (maxTicks > 0 && watcher.ticks >= maxTicks) stopWatcher(watcher.targetId, 'reached maxTicks')
       return
     }
@@ -636,7 +731,7 @@ export function apply(ctx, config) {
       `monitor 巡检 #${watcher.ticks}`,
     )
     if (maxTicks > 0 && watcher.ticks >= maxTicks) stopWatcher(watcher.targetId, 'reached maxTicks')
-    writeStatus(statusPath, describe())
+    writeStatus(statusPath, describe(), INSTANCE_ID)
     if (!delivered) {
       // The supervisor is gone; stop rather than ticking into the void.
       stopWatcher(watcher.targetId, 'supervisor offline')
@@ -669,7 +764,7 @@ export function apply(ctx, config) {
     }, everyMinutes * 60_000)
     watcher.timer?.unref?.()
     watchers.set(target.id, watcher)
-    writeStatus(statusPath, describe())
+    writeStatus(statusPath, describe(), INSTANCE_ID)
     tick(watcher)
     return watcher
   }
@@ -688,7 +783,7 @@ export function apply(ctx, config) {
         appendReceipt(receiptsPath, { at: new Date().toISOString(), event: 'stop', target: id, reason })
       }
     }
-    writeStatus(statusPath, describe())
+    writeStatus(statusPath, describe(), INSTANCE_ID)
     return stopped
   }
 
@@ -749,7 +844,7 @@ export function apply(ctx, config) {
         '',
       ].join('\n'))
     }
-    writeStatus(statusPath, describe())
+    writeStatus(statusPath, describe(), INSTANCE_ID)
     return { ok: true, message: `已注入到 ${target.id}（${mode === 'queue' ? '下一轮' : '下一步'}生效）。` }
   }
 
@@ -1089,6 +1184,40 @@ export function apply(ctx, config) {
   })
 
   // Stop the timers when the plugin unloads.
+  // Watchers live in memory only. Without re-arming, a plugin reload leaves the old
+  // timer running old code — which is exactly how a supervisor ends up ticking an
+  // unchanged session forever while the new code never sees it.
+  const pendingArm = new Map(
+    readStatusWatchers(statusPath)
+      .filter(entry => typeof entry?.targetId === 'string' && entry.targetId !== '')
+      .filter(entry => typeof entry?.supervisorId === 'string' && entry.supervisorId !== '')
+      .map(entry => [entry.targetId, entry]),
+  )
+
+  /** Attach every persisted watcher whose two sessions are live again. */
+  function armPending() {
+    for (const [targetId, entry] of pendingArm) {
+      if (watchers.has(targetId)) {
+        pendingArm.delete(targetId)
+        continue
+      }
+      const target = agentOf(targetId)
+      const supervisor = agentOf(entry.supervisorId)
+      if (target === undefined || supervisor === undefined) continue
+      pendingArm.delete(targetId)
+      startWatcher(target, supervisor, Number(entry.everyMinutes) > 0 ? Number(entry.everyMinutes) : defaultEveryMinutes)
+    }
+  }
+
+  if (enabled && pendingArm.size > 0) {
+    ctx.on('agent/created', () => armPending())
+    const firstArm = setTimeout(armPending, 1_500)
+    firstArm?.unref?.()
+    const armSweep = setInterval(armPending, 15_000)
+    armSweep?.unref?.()
+    ctx.on('dispose', () => { clearInterval(armSweep) })
+  }
+
   ctx.on('dispose', () => {
     for (const watcher of watchers.values()) {
       if (watcher.timer !== undefined) clearInterval(watcher.timer)
@@ -1096,3 +1225,9 @@ export function apply(ctx, config) {
     watchers.clear()
   })
 }
+
+// source-watch probe 1794625904
+
+// probe2 1794625992
+
+// hot-reload confirm 1794626300

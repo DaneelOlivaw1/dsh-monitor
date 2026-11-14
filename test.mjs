@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { buildTickText, loadSupervisorSkill, parseMonitorCommand, parseSkillDocument, renderSnapshot, snapshotFingerprint, TICK_FORMAT } from './index.mjs'
+import { buildTickText, DEFAULT_IDLE_ROUNDS, loadSupervisorSkill, parseMonitorCommand, parseSkillDocument, renderSnapshot, snapshotFingerprint, TICK_FORMAT } from './index.mjs'
 
 test('parseMonitorCommand: empty input is usage', () => {
   assert.deepEqual(parseMonitorCommand(''), { action: 'usage' })
@@ -188,6 +188,15 @@ test('buildTickText: names the skill, asks for the five lines, keeps the inject 
   assert.ok(text.includes('/monitor once session-abc 200'))
   assert.ok(text.includes('/monitor inject session-abc'))
   assert.ok(text.includes('unknown tool'))
+  // 给它上一轮的结论，否则它只能从零复述状态
+  const withRound = buildTickText({ tick: 2, everyMinutes: 5, snapshot: 'x', targetId: 'sid', lastRound: 'stuck · 同一报错第 3 次' })
+  assert.ok(withRound.includes('上一轮：stuck · 同一报错第 3 次'))
+  // 明令禁止状态总结
+  assert.ok(text.includes('不要复述目标在做什么'))
+})
+
+test('DEFAULT_IDLE_ROUNDS: 默认不自动停（跳过不花模型回合，停只会漏掉它重新开工那轮）', () => {
+  assert.equal(DEFAULT_IDLE_ROUNDS, 0)
 })
 
 test('snapshotFingerprint: 只有时间变了的快照算「没动静」', () => {
