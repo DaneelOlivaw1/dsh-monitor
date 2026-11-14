@@ -52,9 +52,16 @@ already said, and says that a failure shape seen a third time becomes a gate
 workflow, in four layers: **roles** (`agents/*.md`), **process**
 (`docs/dev-flow.md`), **gates** (`.dsh/gates.yml`), and **ledger** (`memory/`).
 
-```bash
-bash scripts/init-governance.sh /path/to/project
+In a session:
+
 ```
+/governance [<project dir>]
+```
+
+The command hands the work to a model, not to a copy script: it reads what the
+project already has (`AGENTS.md`, `agents/`, `memory/`, `docs/`, `.dsh/gates.yml`,
+and the real test/build commands), then only fills the missing layer — at most four
+new files — instead of dropping a second parallel system next to the first one.
 
 Each gate states a *necessary* condition only — something a program can count,
 grep, or run — because a sufficient condition needs judgement and misfires.
@@ -70,7 +77,7 @@ decide what counts as finished.
 | `skills/monitor-supervisor/SKILL.md` | the judgement method |
 | `cordis.patch.yml` | bundle patch with the default config |
 | `templates/governance/` | project governance skeleton (roles / process / gates / ledger) |
-| `scripts/init-governance.sh` | copy that skeleton into a project without overwriting |
+| `skills/governance-init/SKILL.md` | the merge procedure `/governance` follows |
 
 ## Runtime data
 

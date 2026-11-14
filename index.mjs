@@ -30,7 +30,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -146,6 +146,37 @@ export function parseSkillDocument(source) {
  * @param root - package root containing `skills/`.
  * @returns the arguments for `ctx.skills.register`.
  */
+export function loadBundledSkills(root = PACKAGE_ROOT) {
+  const dir = join(root, 'skills')
+  let names = []
+  try {
+    names = readdirSync(dir, { withFileTypes: true })
+      .filter(entry => entry.isDirectory())
+      .map(entry => entry.name)
+  } catch {
+    return []
+  }
+  const skills = []
+  for (const name of names) {
+    try {
+      const { meta, body } = parseSkillDocument(readFileSync(join(dir, name, 'SKILL.md'), 'utf8'))
+      if (body === '') continue
+      skills.push({
+        name: meta.name ?? name,
+        description: meta.description ?? '',
+        content: body,
+        invocation: { modelInvocable: true, userInvocable: true },
+        source: 'bundled',
+        path: join(dir, name, 'SKILL.md'),
+        resourceBase: { kind: 'directory', path: root },
+      })
+    } catch {
+      // A broken skill must not take the whole plugin down.
+    }
+  }
+  return skills
+}
+
 export function loadSupervisorSkill(root = PACKAGE_ROOT) {
   const path = join(root, 'skills', SUPERVISOR_SKILL, 'SKILL.md')
   const { meta, body } = parseSkillDocument(readFileSync(path, 'utf8'))
@@ -330,6 +361,16 @@ export function parseMonitorCommand(raw) {
     sessionId: tokens[0],
     everyMinutes: Number.isFinite(everyMinutes) && everyMinutes > 0 ? everyMinutes : DEFAULT_EVERY_MINUTES,
   }
+}
+
+/**
+ * Parse the text after `/governance`.
+ * @param raw - `invocation.rawInput`.
+ * @returns the target directory, or undefined for the session working directory.
+ */
+export function parseGovernanceCommand(raw) {
+  const path = String(raw ?? '').trim()
+  return path === '' ? {} : { path }
 }
 
 /** Build the user-role message the harness persists for an injected note. */
@@ -599,11 +640,8 @@ export function apply(ctx, config) {
   // The bundled skill is the judgement method itself. Registering it means the
   // supervising session can load it by name, and code and prose stay one artifact.
   ctx.inject(['skills'], (child) => {
-    try {
-      const skill = loadSupervisorSkill()
-      child.effect(() => child.skills.register(skill), 'monitor: supervisor skill')
-    } catch (error) {
-      ctx.logger?.warn?.(`monitor: supervisor skill not registered: ${error instanceof Error ? error.message : String(error)}`)
+    for (const skill of loadBundledSkills()) {
+      child.effect(() => child.skills.register(skill), `monitor: skill ${skill.name}`)
     }
   })
 
@@ -733,7 +771,44 @@ export function apply(ctx, config) {
 
   /** Run one supervision tick for one watcher. */
   function tick(watcher) {
-    if (!enabled) return
+    // `/governance` hands the project's governance setup to a model, not to a copy
+  // script: each project already has its own AGENTS.md/agents/memory layout and its
+  // own commands, so blind copying produces two overlapping systems.
+  ctx.commands.register({
+    definitionId: '@deepseek-ai/dsh-monitor/governance',
+    name: 'governance',
+    description: 'Lay the four-layer project governance skeleton (roles / process / gates / ledger) by merging into what the project already has',
+    input: { hint: '[<项目目录>]' },
+    handler: (invocation) => {
+      const parsed = parseGovernanceCommand(invocation.rawInput)
+      const dir = parsed.path ?? safeWorkingDirectory(invocation.agent) ?? process.cwd()
+      const text = [
+        `（治理走查 · /governance）`,
+        '',
+        `目标目录：${dir}`,
+        '',
+        '按 `governance-init` 技能给这个项目铺四层骨架（角色 / 流程 / 闸门 / 台账）：',
+        '1. 先读已有的：AGENTS.md、agents/ 或 .pi/agents/、memory/、docs/、.dsh/gates.yml，以及真实的测试/构建/格式化命令。',
+        '2. 只补缺失的那层，最多新增 4 个文件（外加 .dsh/gates.yml）；不覆盖、不搬家、不重写已有文件。',
+        '3. 闸门只放必要条件（能数 / 能 grep / 能跑脚本），默认 3–5 条，宁少不多。',
+        '4. 命令、角色、证据口径都按这个项目定制，不许原样搬模板。',
+        '',
+        `模板仅作参考：${join(PACKAGE_ROOT, 'templates', 'governance')}`,
+        '按技能里的「汇报格式」固定输出：读完的现状 / 新增 / 改动 / 闸门 / 没动 / 下一步。',
+        '铺完不要 commit，等用户看过。',
+      ].join('\n')
+      const message = monitorMessage(text, '/governance 铺治理骨架')
+      try {
+        if (invocation.agent?.status === 'running') invocation.agent.inject(message)
+        else invocation.agent?.followup?.(message)
+      } catch (error) {
+        return { kind: 'error', text: `没能把任务交给本会话：${error instanceof Error ? error.message : String(error)}` }
+      }
+      return { kind: 'success', text: `已交给本会话：按 governance-init 走查 ${dir}（先读后补，不覆盖）。` }
+    },
+  })
+
+  if (!enabled) return
     const owner = readStatusOwner(statusPath)
     if (owner !== undefined && owner !== INSTANCE_ID) {
       // Another live instance owns the timers. Stand down without writing, so the

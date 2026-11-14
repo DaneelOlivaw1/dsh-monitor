@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
-import { buildTickText, DEFAULT_IDLE_ROUNDS, evidenceProblems, maxEventId, loadSupervisorSkill, parseMonitorCommand, parseSkillDocument, renderSnapshot, snapshotFingerprint, TICK_FORMAT } from './index.mjs'
+import { buildTickText, DEFAULT_IDLE_ROUNDS, evidenceProblems, loadBundledSkills, maxEventId, parseGovernanceCommand, loadSupervisorSkill, parseMonitorCommand, parseSkillDocument, renderSnapshot, snapshotFingerprint, TICK_FORMAT } from './index.mjs'
 
 test('parseMonitorCommand: empty input is usage', () => {
   assert.deepEqual(parseMonitorCommand(''), { action: 'usage' })
@@ -245,4 +245,19 @@ test('治理模板：角色/流程/台账/闸门都在', () => {
   }
   // deliver-with-evidence 必须同时要 L1 与 L3，只有接口返回不算完成
   assert.ok(gates.includes('L1') && gates.includes('L3'))
+})
+
+test('parseGovernanceCommand: 不带参数就用会话目录，带了就用它', () => {
+  assert.deepEqual(parseGovernanceCommand(''), {})
+  assert.deepEqual(parseGovernanceCommand('   '), {})
+  assert.deepEqual(parseGovernanceCommand('/Users/x/proj'), { path: '/Users/x/proj' })
+})
+
+test('loadBundledSkills: 两个技能都能读出来，且都带判断方法', () => {
+  const skills = loadBundledSkills()
+  const names = skills.map((skill) => skill.name).sort()
+  assert.deepEqual(names, ['governance-init', 'monitor-supervisor'])
+  const governance = skills.find((skill) => skill.name === 'governance-init')
+  // 走查技能必须写清「先读后补、不覆盖、只补必要条件」
+  for (const token of ['先读', '不覆盖', '必要条件']) assert.ok(governance.content.includes(token), `缺 ${token}`)
 })
