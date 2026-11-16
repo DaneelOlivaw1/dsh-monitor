@@ -1,7 +1,7 @@
 {
   "name": "dsh-monitor",
   "version": "0.4.1",
-  "description": "DeepSeek Harness bundle plugin: /monitor puts an AI supervisor on another session — timer + snapshots + injection tools, judgement left to the model. Ships a 「派生监管者」 header button that derives a supervisor for the session you are viewing.",
+  "description": "DeepSeek Harness bundle plugin: /monitor puts an AI supervisor on another session — timer + snapshots + injection tools, judgement left to the model. Ships a 「派生监管者」 header button that derives a supervisor for the session you are viewing. Ships a loop document (monitor/loops.yml): the development flow as phases/sub-loops with timestamped state transitions, including trial chains that branch out after a mistake and return.",
   "type": "module",
   "main": "index.mjs",
   "exports": {
@@ -11,12 +11,16 @@
   },
   "files": [
     "index.mjs",
+    "loop.mjs",
     "client/client.js",
+    "client/src/client.js",
+    "scripts/build.mjs",
     "skills/monitor-supervisor/SKILL.md",
     "cordis.patch.yml",
     "README.zh.md",
     "README.md",
-    "templates/**"
+    "templates/**",
+    "client/src/viewport.js"
   ],
   "keywords": [
     "dsh",
@@ -33,7 +37,9 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "node --test test.mjs"
+    "test": "node --test test.mjs",
+    "eval": "node eval/run.mjs",
+    "build": "node scripts/build.mjs"
   },
   "dsh": {
     "bundle": {
@@ -43,11 +49,17 @@
       "platform": "web",
       "inject": [
         "@deepseek-ai/dsh-client-locale",
-        "@deepseek-ai/dsh-client-ui-workspace"
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
       ]
     }
   },
   "dependencies": {
-    "@deepseek-ai/schemastery": "^3.19.0"
+    "@deepseek-ai/schemastery": "^3.19.0",
+    "yaml": "^2.5.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "mermaid": "^11.17.0"
   }
 }

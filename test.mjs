@@ -4,6 +4,8 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
 import { buildTickText, DEFAULT_IDLE_ROUNDS, evidenceProblems, loadBundledSkills, maxEventId, parseGovernanceCommand, loadSupervisorSkill, parseMonitorCommand, parseSkillDocument, renderSnapshot, snapshotFingerprint, TICK_FORMAT } from './index.mjs'
+import { appendLoopTransition, emptyLoopDocument, ensureLoopNode, findLoopNode, LABEL_COLUMNS, loopPosition, normalizeLoopPath, parseLoopDocument, renderLoopDocument, renderLoopGraph, serializeLoopDocument, wrapMermaidLabel } from './loop.mjs'
+import { clampScale, fitScale, initialScale, scrollAfterZoom } from './client/src/viewport.js'
 
 test('parseMonitorCommand: empty input is usage', () => {
   assert.deepEqual(parseMonitorCommand(''), { action: 'usage' })
@@ -245,6 +247,10 @@ test('治理模板：角色/流程/台账/闸门都在', () => {
   }
   // deliver-with-evidence 必须同时要 L1 与 L3，只有接口返回不算完成
   assert.ok(gates.includes('L1') && gates.includes('L3'))
+  // 证据有固定落脚处：跟着计划编号走，不另建顶层目录
+  assert.ok(gates.includes('plans/NNNN-*/evidence/INDEX.md'), '闸门缺证据目录判据')
+  const entry = readFileSync(join(root, 'AGENTS.md'), 'utf8')
+  assert.ok(entry.includes('计划同目录的 `evidence/`'), '入口缺交付证据位置')
 })
 
 test('parseGovernanceCommand: 不带参数就用会话目录，带了就用它', () => {
@@ -260,4 +266,142 @@ test('loadBundledSkills: 两个技能都能读出来，且都带判断方法', (
   const governance = skills.find((skill) => skill.name === 'governance-init')
   // 走查技能必须写清「先读后补、不覆盖、只补必要条件」
   for (const token of ['先读', '不覆盖', '必要条件']) assert.ok(governance.content.includes(token), `缺 ${token}`)
+  // 不按文件数卡上限；AGENTS.md 重排、台账只改格式、证据跟着计划目录走
+  for (const token of ['重写成四层结构', '改格式，不改事实', 'plans/NNNN-YYYY-MM-DD-标题/evidence/']) {
+    assert.ok(governance.content.includes(token), `缺 ${token}`)
+  }
+  assert.ok(!governance.content.includes('最多新增 4 个文件'), '文件数上限应已删除')
+})
+
+// ── loop 状态机：结构 + 时序转移 ─────────────────────────────────────────────
+
+test('loop: 路径校验（空段/空格/点段都是错）', () => {
+  assert.deepEqual(normalizeLoopPath(''), [])
+  assert.deepEqual(normalizeLoopPath('.'), [])
+  assert.deepEqual(normalizeLoopPath('inbound/trial-401'), ['inbound', 'trial-401'])
+  assert.throws(() => normalizeLoopPath('inbound//x'), /空段/)
+  assert.throws(() => normalizeLoopPath('in bound'), /空格/)
+  assert.throws(() => normalizeLoopPath('..'), /不能用/)
+})
+
+test('loop: 声明节点会自动补齐中间层，父不存在的深层不会静默丢', () => {
+  const doc = emptyLoopDocument({ id: 'wecom', title: '企微入站上线' })
+  const ensured = ensureLoopNode(doc, 'inbound/flow/test', { title: '写测试', kind: 'step' })
+  assert.deepEqual(ensured.created, ['inbound', 'inbound/flow', 'inbound/flow/test'])
+  assert.equal(findLoopNode(doc, 'inbound/flow/test').title, '写测试')
+  assert.equal(findLoopNode(doc, 'inbound/flow/test').kind, 'step')
+  assert.equal(findLoopNode(doc, 'inbound').kind, 'phase')
+  assert.equal(findLoopNode(doc, 'inbound/flow').kind, 'flow')
+})
+
+test('loop: 转移类型由路径关系推导，不靠模型填', () => {
+  const doc = emptyLoopDocument({ id: 'wecom', title: '企微入站上线' })
+  const first = appendLoopTransition(doc, { at: '2026-11-14T09:00:00+08:00', loop: 'inbound', state: '未部署' })
+  assert.equal(first.kind, 'enter')
+  const held = appendLoopTransition(doc, { at: '2026-11-14T09:05:00+08:00', loop: 'inbound', state: '未部署' })
+  assert.equal(held.kind, 'stay')
+  const advanced = appendLoopTransition(doc, { at: '2026-11-14T09:06:00+08:00', loop: 'inbound', state: '已部署' })
+  assert.equal(advanced.kind, 'advance')
+  const branch = appendLoopTransition(doc, { at: '2026-11-14T09:10:00+08:00', loop: 'inbound/trial-401', state: '试 token', outcome: 'suspended' })
+  assert.equal(branch.kind, 'branch')
+  const back = appendLoopTransition(doc, { at: '2026-11-14T09:24:00+08:00', loop: 'inbound', state: '修域名', outcome: 'done' })
+  assert.equal(back.kind, 'return')
+  assert.deepEqual(back.transition.from, { loop: 'inbound/trial-401', state: '试 token' })
+  // 顶层阶段之间的推进是 advance；跨分支才算 jump
+  const nextPhase = appendLoopTransition(doc, { at: '2026-11-14T09:30:00+08:00', loop: 'outbound', state: '开始', outcome: 'done' })
+  assert.equal(nextPhase.kind, 'advance')
+  assert.equal(appendLoopTransition(doc, { at: '2026-11-14T09:31:00+08:00', loop: 'outbound/flow/probe', state: '探活', outcome: 'suspended' }).kind, 'enter')
+  assert.equal(appendLoopTransition(doc, { at: '2026-11-14T09:32:00+08:00', loop: 'deploy/flow/build', state: '构建', outcome: 'abandoned', note: '换阶段' }).kind, 'jump')
+})
+
+test('loop: 时间倒退、空状态都被挡下（转移链只往后接）', () => {
+  const doc = emptyLoopDocument({ id: 'wecom', title: '企微' })
+  appendLoopTransition(doc, { at: '2026-11-14T09:10:00+08:00', loop: 'inbound', state: '未部署' })
+  assert.throws(
+    () => appendLoopTransition(doc, { at: '2026-11-14T09:05:00+08:00', loop: 'inbound', state: '已部署' }),
+    /时间倒退/,
+  )
+  // 有上一位置：空 state 按「原地停留」记，不是错
+  const stay = appendLoopTransition(doc, { at: '2026-11-14T09:20:00+08:00', loop: 'inbound', state: '' })
+  assert.equal(stay.kind, 'stay')
+  assert.equal(stay.transition.to.state, '未部署')
+  // 没有上一位置、也没给 state：报错
+  assert.throws(() => appendLoopTransition(emptyLoopDocument({ id: 'x', title: 'x' }), { at: '2026-11-14T09:20:00+08:00' }), /state/)
+  assert.throws(() => appendLoopTransition(doc, { at: '不是时间', loop: 'inbound', state: 'x' }), /时间读不出来/)
+})
+
+test('loop: 试错链分叉后能回到原 loop，当前位置跟着最后一条走', () => {
+  const doc = emptyLoopDocument({ id: 'wecom', title: '企微入站上线' })
+  appendLoopTransition(doc, { at: '2026-11-14T09:00:00+08:00', loop: 'inbound', state: '未部署' })
+  appendLoopTransition(doc, { at: '2026-11-14T09:10:00+08:00', loop: 'inbound/trial-401', state: '试 token', fact: '401 ×3', outcome: 'suspended' })
+  appendLoopTransition(doc, { at: '2026-11-14T09:24:00+08:00', loop: 'inbound', state: '修域名', fact: '域名指错', outcome: 'done' })
+  assert.deepEqual(loopPosition(doc), { loop: 'inbound', state: '修域名', at: '2026-11-14T09:24:00+08:00' })
+})
+
+test('loop: 序列化后能原样读回来', () => {
+  const doc = emptyLoopDocument({ id: 'wecom', title: '企微入站上线', goal: '收一条真实消息' })
+  appendLoopTransition(doc, { at: '2026-11-14T09:00:00+08:00', loop: 'inbound', state: '未部署', updates: ['bridge/a.mjs#换 token'] })
+  const again = parseLoopDocument(serializeLoopDocument(doc))
+  assert.equal(again.loop.id, 'wecom')
+  assert.equal(again.transitions.length, 1)
+  assert.deepEqual(again.transitions[0].updates, ['bridge/a.mjs#换 token'])
+})
+
+test('loop: 渲染出结构、当前位置和带事实的转移，试错链缩进在分叉处下面', () => {
+  const doc = emptyLoopDocument({ id: 'wecom', title: '企微入站上线' })
+  ensureLoopNode(doc, 'inbound', { title: '入站', kind: 'phase' })
+  ensureLoopNode(doc, 'inbound/trial-401', { title: '试错 401', kind: 'trial' })
+  appendLoopTransition(doc, { at: '2026-11-14T09:00:00+08:00', loop: 'inbound', state: '未部署' })
+  appendLoopTransition(doc, { at: '2026-11-14T09:10:00+08:00', loop: 'inbound/trial-401', state: '试 token', fact: '401 三次', outcome: 'suspended' })
+  appendLoopTransition(doc, { at: '2026-11-14T09:24:00+08:00', loop: 'inbound', state: '修域名', outcome: 'done' })
+  const text = renderLoopDocument(doc, { all: true })
+  assert.match(text, /企微入站上线（wecom）/)
+  assert.match(text, /现在：入站 · 修域名/)
+  assert.match(text, /├▶/)
+  assert.match(text, /◀┤/)
+  assert.match(text, /事实：401 三次/)
+})
+
+test('parseMonitorCommand: loop 子命令的路径与开关', () => {
+  assert.deepEqual(parseMonitorCommand('loop'), { action: 'loop' })
+  assert.deepEqual(parseMonitorCommand('loop inbound'), { action: 'loop', path: 'inbound' })
+  assert.deepEqual(parseMonitorCommand('loop inbound --all --json'), { action: 'loop', path: 'inbound', all: true, json: true })
+  assert.deepEqual(parseMonitorCommand('loop --target=session-x'), { action: 'loop', sessionId: 'session-x' })
+})
+
+test('loop: 图标签先按段落断开，再按显示宽度折行', () => {
+  const lines = wrapMermaidLabel(['设计 › 数据模型', '只记轮次，没有 loop 标识'])
+  assert.equal(lines[0], '设计 › 数据模型')
+  assert.match(lines.slice(1).join(' '), /只记轮次/)
+  const width = text => [...text].reduce((sum, char) => { const code = char.codePointAt(0) ?? 0; return sum + ((code >= 0x2e80 && code <= 0xa4cf) || (code >= 0xff00 && code <= 0xff60) ? 2 : 1) }, 0)
+  for (const line of lines) assert.ok(width(line) <= LABEL_COLUMNS * 2, '行超宽：' + line)
+})
+
+test('loop: 折行不吃掉行尾的右括号', () => {
+  const lines = wrapMermaidLabel(['改走 workingDirectory.get()'], 8)
+  assert.ok(lines.at(-1).endsWith('()'), lines.join('|'))
+})
+
+test('loop: 状态图不产生一行超宽的节点标签', () => {
+  const doc = emptyLoopDocument({ id: 'demo', title: '演示' })
+  ensureLoopNode(doc, 'impl', { title: '实现', kind: 'phase' })
+  appendLoopTransition(doc, { loop: 'impl', state: '把很长的一句话状态写进来看看它会不会溢出节点框' })
+  const graph = renderLoopGraph(doc)
+  assert.match(graph, /^flowchart TB/)
+  assert.ok(graph.includes('<br/>'))
+  const width = text => [...text].reduce((sum, char) => { const code = char.codePointAt(0) ?? 0; return sum + ((code >= 0x2e80 && code <= 0xa4cf) || (code >= 0xff00 && code <= 0xff60) ? 2 : 1) }, 0)
+  for (const label of [...graph.matchAll(/"([^"]+)"/g)].map(match => match[1])) {
+    for (const line of label.split('<br/>')) assert.ok(width(line) <= LABEL_COLUMNS * 2, '标签超宽：' + line)
+  }
+})
+
+test('viewer: 全图取较紧的一轴，锚点缩放不跑位', () => {
+  assert.equal(fitScale({ width: 200, height: 1000 }, { width: 300, height: 400 }), 0.4)
+  assert.equal(initialScale({ width: 200, height: 100 }, { width: 300, height: 400 }), 1)
+  assert.equal(clampScale(99), 4)
+  const moved = scrollAfterZoom({ scrollLeft: 100, scrollTop: 500, x: 50, y: 100, prev: 0.5, next: 1 })
+  assert.equal(moved.left, 250)
+  assert.equal(moved.top, 1100)
+  assert.equal((moved.left + 50) / 1, (100 + 50) / 0.5)
+  assert.deepEqual(scrollAfterZoom({ scrollLeft: 7, scrollTop: 9, x: 1, y: 1, prev: 0, next: 1 }), { left: 7, top: 9 })
 })

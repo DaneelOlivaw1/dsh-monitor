@@ -1,0 +1,5 @@
+// 进了 inbound 后跨到 inbound/trial-401，不填 outcome → 应被拒收，第二条转移不进文档。
+{"op":"declare","loop":"inbound","title":"入站","kind":"phase"}
+{"op":"declare","loop":"inbound/trial-401","title":"试错 401","kind":"trial"}
+{"op":"move","loop":"inbound","state":"未部署"}
+{"op":"move","loop":"inbound/trial-401","state":"试 token"}

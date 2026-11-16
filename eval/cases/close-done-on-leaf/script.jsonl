@@ -1,0 +1,5 @@
+// 在 inbound/flow/impl 上收尾，position 不变；节点和 transitions 都该记上。
+{"op":"declare","loop":"inbound/flow/impl","title":"实现","kind":"step"}
+{"op":"move","loop":"inbound/flow/impl","state":"改域名后握手成功"}
+{"op":"close","outcome":"done"}
+{"op":"close","outcome":"abandoned"}

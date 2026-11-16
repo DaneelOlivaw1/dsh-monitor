@@ -46,9 +46,9 @@ gates:
 
   - id: deliver-with-evidence
     when: 声称「完成 / 修好 / 上线」
-    require: L1 界面证据 + L3 库行证据同时存在，且带指针（文件:行 / 命令输出 / 库行）
+    require: plans/NNNN-*/evidence/INDEX.md 存在，且每行指针落到真实文件；L1 界面证据（截图）+ L3 库行证据（输出原文）齐备
     enforce: block
-    message: 只有接口返回（L2）不算完成，补界面与库行证据。
+    message: 只有接口返回（L2）不算完成。证据进 plans/NNNN-YYYY-MM-DD-标题/evidence/，INDEX 一行一条，跟着 git 走。
 
   - id: ledger-sync
     when: 改了 memory/constraints 覆盖的文件

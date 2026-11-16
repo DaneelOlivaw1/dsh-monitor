@@ -1,0 +1,6 @@
+[
+  { "op": "declare", "outcome": "ok" },
+  { "op": "declare", "outcome": "ok" },
+  { "op": "move", "outcome": "ok" },
+  { "op": "move", "outcome": "reject" }
+]

@@ -1,3 +1,5 @@
 node_modules
 .DS_Store
 *.log
+# runtime data for whichever project this plugin is watching
+monitor/loops.yml

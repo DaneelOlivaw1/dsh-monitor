@@ -23,10 +23,11 @@
 ## 架构防腐（强制）
 
 1. 本文件保持「薄」：只放指针，细节进 `docs/`
-2. 新增台账条目 → 同轮在 `memory/MEMORY.md` 加索引行
+2. 新增台账条目 → 同轮在 `memory/MEMORY.md` 加索引行；格式照 `TEMPLATE.md`，格式不对先改格式再写内容
 3. 新计划 → `plans/NNNN-YYYY-MM-DD-标题/`，并更新「当前状态」
-4. 新决策 → `docs/adr/` 或 findings，保证从索引能找到
-5. 新角色 → `agents/`；新技能 → `.agents/skills/`；别塞根目录
+4. 交付证据 → 计划同目录的 `evidence/`（`INDEX.md` 一行一条 + 截图 / 输出 / 退出码），只追加不覆盖
+5. 新决策 → `docs/adr/` 或 findings，保证从索引能找到
+6. 新角色 → `agents/`；新技能 → `.agents/skills/`；别塞根目录
 
 ## 禁止事项
 

@@ -23,6 +23,7 @@
  *   /monitor status                              what is being watched
  *   /monitor once [sessionId]                    one snapshot round, off-schedule
  *   /monitor stop [sessionId|all]                stop supervising
+ *   /monitor loop [path] [--all] [--json]        the project's loop document: structure + state transitions
  *
  * The supervisor gets a notice in its inbox on every tick, with two tools:
  * `monitor_snapshot` (look deeper) and `monitor_inject` (push guidance into the
@@ -30,11 +31,27 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import z from '@deepseek-ai/schemastery'
+import {
+  NODE_KINDS,
+  appendLoopTransition,
+  closeLoopNode,
+  LOOP_OUTCOMES,
+  emptyLoopDocument,
+  loopDocumentView,
+  ensureLoopNode,
+  findLoopNode,
+  listLoopNodes,
+  loopExists,
+  loopPosition,
+  parseLoopDocument,
+  renderLoopDocument,
+  serializeLoopDocument,
+} from './loop.mjs'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'monitor'
@@ -285,6 +302,8 @@ export const TICK_RULES = [
   '- 不要复述目标在做什么，那是状态总结，不是判断。前提写的是断言，证据只列上一轮之后新增的。',
   '- 没有新增证据：只回 `**裁决** NO_NEW_EVIDENCE` 和一行理由，其余不要写。',
   '- 每块最多两句；证据 2–4 条，一条一个指针；不用表格。',
+  '- 裁决时一并给 `loop` / `state` / `updates`：state 是这一轮之后该 loop 的状态（一句话：卡在哪、什么已成立），没变就原样再写一遍；变了说明前一状态被事实推翻，旧状态会作为 from 留在 loops.yml。updates 写「路径#改了什么」，没动文件就省略。',
+  '- 项目有多个 loop：顶层是总流程，`loop` 用路径定位到具体那一层（如 `inbound/trial-401`）；新分支先用 monitor_loop declare 声明，试错链用 kind: trial。',
 ]
 
 /**
@@ -355,6 +374,16 @@ export function parseMonitorCommand(raw) {
   if (head === 'inject') {
     return { action: 'inject', sessionId: tokens[1] ?? 'latest', text: tokens.slice(2).join(' ') }
   }
+  if (head === 'loop' || head === 'tree') {
+    const action = { action: 'loop' }
+    for (const token of tokens.slice(1)) {
+      if (token === '--json') action.json = true
+      else if (token === '--all') action.all = true
+      else if (token.startsWith('--target=')) action.sessionId = token.slice('--target='.length)
+      else if (!token.startsWith('-') && action.path === undefined) action.path = token
+    }
+    return action
+  }
   const everyMinutes = Number(tokens[1])
   return {
     action: 'start',
@@ -371,6 +400,80 @@ export function parseMonitorCommand(raw) {
 export function parseGovernanceCommand(raw) {
   const path = String(raw ?? '').trim()
   return path === '' ? {} : { path }
+}
+
+/** Where a project's loop document lives: inside the project, so it travels with git. */
+export function loopFilePath(cwd) {
+  return join(String(cwd), 'monitor', 'loops.yml')
+}
+
+/** Receipt rows, oldest first; malformed lines are skipped rather than fatal. */
+export function readReceiptRows(path) {
+  let text
+  try {
+    text = readFileSync(path, 'utf8')
+  } catch {
+    return []
+  }
+  const rows = []
+  for (const line of text.split('\n')) {
+    if (line.trim() === '') continue
+    try {
+      const row = JSON.parse(line)
+      if (row !== null && typeof row === 'object') rows.push(row)
+    } catch {
+      // A half-written last line is not a reason to lose the file.
+    }
+  }
+  return rows
+}
+
+/**
+ * Load a project's loop document, creating an empty one the first time.
+ *
+ * Empty rather than backfilled: the tree states which loops exist and where the
+ * work is, which a receipt log cannot tell us — a receipt says a round happened,
+ * not which phase it belonged to. The supervisor declares the structure.
+ *
+ * @returns { doc, created }
+ */
+export function loadLoopDocument({ path, cwd }) {
+  try {
+    return { doc: parseLoopDocument(readFileSync(path, 'utf8')), created: false }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error
+  }
+  return { doc: emptyLoopDocument({ id: basename(String(cwd)), title: basename(String(cwd)) }), created: true }
+}
+
+/** Write the document atomically: a crash mid-write must not leave half a YAML. */
+export function writeLoopDocument(path, doc) {
+  mkdirSync(dirname(path), { recursive: true })
+  const temporary = `${path}.tmp-${process.pid}`
+  writeFileSync(temporary, serializeLoopDocument(doc))
+  renameSync(temporary, path)
+}
+
+/**
+ * Move the run to the position this round ended at.
+ *
+ * The previous position comes from the document, so the transition always names
+ * both ends: a state that changed is paired with the one it replaced, which is
+ * what "it was wrong here, because of this" reads as.
+ */
+export function applyVerdictToLoop({ doc, loop, verdict, state, updates, fact, round, by, outcome, note }) {
+  return appendLoopTransition(doc, {
+    at: new Date().toISOString(),
+    loop,
+    state,
+    fact,
+    updates,
+    round,
+    verdict,
+    by,
+    outcome,
+    note,
+  })
 }
 
 /** Build the user-role message the harness persists for an injected note. */
@@ -743,6 +846,49 @@ export function apply(ctx, config) {
     return renderSnapshot({ agent, goal, limit })
   }
 
+  /**
+   * Move the project's run to where this round ended.
+   *
+   * The document is the human-readable half of the record: the receipts answer
+   * "what happened at 09:10", the document answers "which loop are we in, how did
+   * we get here, and which detour did we come back from". Returns one line for
+   * the tool result, or '' when the round carried no position or the target has
+   * no working directory.
+   */
+  function advanceLoop({ target, verdict, loop, state, updates, fact, round, by, outcome, note }) {
+    const loopPath = String(loop ?? '').trim()
+    if (loopPath === '' && String(state ?? '').trim() === '') return ''
+    const cwd = cwdOf(agentOf(target))
+    if (cwd === undefined) return ''
+    const file = loopFilePath(cwd)
+    try {
+      const loaded = loadLoopDocument({ path: file, cwd })
+      const advanced = applyVerdictToLoop({
+        doc: loaded.doc,
+        loop: loopPath,
+        verdict,
+        state,
+        updates,
+        fact,
+        round,
+        by,
+        outcome,
+        note,
+      })
+      writeLoopDocument(file, loaded.doc)
+      const position = loopPosition(loaded.doc)
+      const where = position?.loop === '' ? '根 loop' : position?.loop
+      const cameFrom = advanced.transition.from === null
+        ? '起点'
+        : `${advanced.transition.from.loop === '' ? '根 loop' : advanced.transition.from.loop} · ${advanced.transition.from.state}`
+      const created = advanced.created.length > 0 ? `（新建 ${advanced.created.join(' / ')}）` : ''
+      return `\nloop ${advanced.kind}：${cameFrom} ⇒ ${where} · 现在「${position?.state ?? ''}」· 累计 ${loaded.doc.transitions.length} 条转移${created}`
+    } catch (error) {
+      // The receipt is already written; a broken document must not lose the round.
+      return `\nloop 写入失败（回执已记）：${error instanceof Error ? error.message : String(error)}`
+    }
+  }
+
   /** Deliver one tick notice to the supervising agent. */
   function deliverToSupervisor(supervisor, text, summary) {
     if (supervisor === undefined) return false
@@ -781,7 +927,7 @@ export function apply(ctx, config) {
     input: { hint: '[<项目目录>]' },
     handler: (invocation) => {
       const parsed = parseGovernanceCommand(invocation.rawInput)
-      const dir = parsed.path ?? safeWorkingDirectory(invocation.agent) ?? process.cwd()
+      const dir = parsed.path ?? cwdOf(invocation.agent) ?? process.cwd()
       const text = [
         `（治理走查 · /governance）`,
         '',
@@ -789,9 +935,10 @@ export function apply(ctx, config) {
         '',
         '按 `governance-init` 技能给这个项目铺四层骨架（角色 / 流程 / 闸门 / 台账）：',
         '1. 先读已有的：AGENTS.md、agents/ 或 .pi/agents/、memory/、docs/、.dsh/gates.yml，以及真实的测试/构建/格式化命令。',
-        '2. 只补缺失的那层，最多新增 4 个文件（外加 .dsh/gates.yml）；不覆盖、不搬家、不重写已有文件。',
-        '3. 闸门只放必要条件（能数 / 能 grep / 能跑脚本），默认 3–5 条，宁少不多。',
-        '4. 命令、角色、证据口径都按这个项目定制，不许原样搬模板。',
+        '2. 只补缺失的那层；不设新增文件数上限，但每个新文件都要挂在四层之一、被 AGENTS.md 或 memory 索引指向，不留孤岛。',
+        '3. AGENTS.md 一坨就按四层重排（原有规则逐条保留）；已有 memory/ 沿用其索引与条目格式，格式不对就地改对，只改格式不改事实。',
+        '4. 闸门只放必要条件（能数 / 能 grep / 能跑脚本），默认 3–5 条，宁少不多。',
+        '5. 命令、角色、证据口径都按这个项目定制，不许原样搬模板；交付证据落 plans/NNNN-YYYY-MM-DD-标题/evidence/，跟着 git 走。',
         '',
         `模板仅作参考：${join(PACKAGE_ROOT, 'templates', 'governance')}`,
         '按技能里的「汇报格式」固定输出：读完的现状 / 新增 / 改动 / 闸门 / 没动 / 下一步。',
@@ -804,7 +951,7 @@ export function apply(ctx, config) {
       } catch (error) {
         return { kind: 'error', text: `没能把任务交给本会话：${error instanceof Error ? error.message : String(error)}` }
       }
-      return { kind: 'success', text: `已交给本会话：按 governance-init 走查 ${dir}（先读后补，不覆盖）。` }
+      return { kind: 'success', text: `已交给本会话：按 governance-init 走查 ${dir}（先读后补，能重排不覆盖）。` }
     },
   })
 
@@ -965,7 +1112,7 @@ export function apply(ctx, config) {
       text: content,
     })
     if (pitfallsSetting.trim() !== '' && (kind === 'stuck' || kind === 'off_track' || kind === 'idle')) {
-      const base = safeWorkingDirectory(target) ?? process.cwd()
+      const base = cwdOf(target) ?? process.cwd()
       const retroPath = isAbsolute(pitfallsSetting) ? pitfallsSetting : resolve(base, pitfallsSetting)
       const stamp = new Date().toISOString().replace('T', ' ').slice(0, 19)
       appendPitfall(retroPath, [
@@ -983,6 +1130,37 @@ export function apply(ctx, config) {
   }
 
   /** Best-effort working directory of a target agent. */
+  /**
+   * The directory a session works in.
+   *
+   * The projection is the cheap path, but it can be empty for a session that
+   * never recorded a transition; the working-directory service is the authority,
+   * so it is asked first. The service is optional (`ctx.get`), because a
+   * non-web composition may not mount it.
+   */
+  function cwdOf(agent) {
+    if (agent === undefined) return undefined
+    let service
+    try {
+      service = ctx.get?.('workingDirectory')
+    } catch {
+      service = undefined
+    }
+    if (service !== undefined && agent.session !== undefined) {
+      try {
+        const value = service.get(agent.session)
+        if (typeof value === 'string' && value !== '') return existsSync(value) ? value : undefined
+      } catch {
+        // fall through to the projection
+      }
+    }
+    const projected = safeWorkingDirectory(agent)
+    // A recorded directory can be gone (a deleted or moved project). Writing a
+    // loop file there would recreate the project as an empty husk, so a missing
+    // directory counts as "no directory".
+    return typeof projected === 'string' && existsSync(projected) ? projected : undefined
+  }
+
   function safeWorkingDirectory(agent) {
     try {
       const projection = agent?.session?.projections?.workingDirectory
@@ -994,12 +1172,69 @@ export function apply(ctx, config) {
     return undefined
   }
 
+  // The right-Sidebar page reads the document over HTTP: the page runs in the
+  // browser and the file lives on the Host, and a read-only GET keeps the page
+  // from needing any write capability of its own.
+  ctx.inject(['webServer'], (webCtx) => {
+    webCtx.effect(() => webCtx.webServer.register({
+      kind: 'exact',
+      path: '/monitor/loop',
+      resource: async (request) => {
+        const url = new URL(request.url)
+        if (request.method !== 'GET') {
+          return new Response(JSON.stringify({ error: 'method' }), {
+            status: 405,
+            headers: { 'content-type': 'application/json; charset=utf-8' },
+          })
+        }
+        const sessionId = url.searchParams.get('session') ?? ''
+        const target = sessionId === '' ? undefined : agentOf(sessionId)
+        const cwd = target === undefined ? undefined : cwdOf(target)
+        if (cwd === undefined) {
+          const known_ids = (() => {
+            try {
+              return [...ctx.agents.list()].slice(0, 5).map(agent => agent?.id)
+            } catch {
+              return []
+            }
+          })()
+          return new Response(JSON.stringify({
+            error: target === undefined ? 'no-agent' : 'no-cwd',
+            session: sessionId,
+            sampleAgentIds: known_ids,
+          }), {
+            status: 404,
+            headers: { 'content-type': 'application/json; charset=utf-8' },
+          })
+        }
+        const file = loopFilePath(cwd)
+        try {
+          const loaded = loadLoopDocument({ path: file, cwd })
+          if (loaded.created) writeLoopDocument(file, loaded.doc)
+          const body = JSON.stringify({
+            ok: true,
+            cwd,
+            file,
+            created: loaded.created,
+            view: loopDocumentView(loaded.doc),
+          })
+          return new Response(body, { headers: { 'content-type': 'application/json; charset=utf-8' } })
+        } catch (error) {
+          return new Response(JSON.stringify({ error: 'read-failed', message: error instanceof Error ? error.message : String(error) }), {
+            status: 500,
+            headers: { 'content-type': 'application/json; charset=utf-8' },
+          })
+        }
+      },
+    }), 'monitor: loop page route')
+  })
+
   if (enabled) {
     ctx.commands.register({
       definitionId: '@deepseek-ai/dsh-monitor/monitor',
       name: 'monitor',
       description: 'Put an AI supervisor on another session: snapshot it, judge it, inject guidance',
-      input: { hint: '[<sessionId|latest> [everyMinutes] | status | once [id] | stop [id|all]]' },
+      input: { hint: '[<sessionId|latest> [everyMinutes] | status | once [id] | stop [id|all] | loop [路径] [--all] [--json]]' },
       handler: (invocation) => {
         const parsed = parseMonitorCommand(invocation.rawInput)
         if (parsed.action === 'usage') {
@@ -1011,6 +1246,7 @@ export function apply(ctx, config) {
               '  /monitor status                              看正在监控谁',
               '  /monitor once [sessionId]                    立即巡检一次',
               '  /monitor stop [sessionId|all]                停止',
+              '  /monitor loop [路径] [--all] [--json]        看开发流程的 loop 树与状态转移',
               '',
               watchers.size === 0 ? '当前没有在监控任何会话。' : `当前监控 ${watchers.size} 个会话。`,
             ].join('\n'),
@@ -1044,6 +1280,55 @@ export function apply(ctx, config) {
           if (target === undefined) return { kind: 'error', text: `找不到会话 ${parsed.sessionId}。` }
           const outcome = injectInto(target, parsed.text, '手动注入', 'guidance', 'steer')
           return { kind: outcome.ok ? 'success' : 'error', text: outcome.message }
+        }
+        if (parsed.action === 'loop') {
+          // The document belongs to the watched project, not to the supervisor's
+          // own directory: a supervisor may live in another project entirely.
+          const watched = parsed.sessionId ?? [...watchers.keys()][0]
+          const target = watched === undefined ? undefined : agentOf(watched)
+          if (target === undefined) {
+            return {
+              kind: 'error',
+              text: watched === undefined
+                ? '还没有监控对象：先 /monitor <sessionId>，或用 /monitor loop --target=<sessionId>。'
+                : `找不到会话 ${watched}。`,
+            }
+          }
+          const cwd = cwdOf(target)
+          if (cwd === undefined) return { kind: 'error', text: `读不到 ${target.id} 的工作目录，无法定位 monitor/loops.yml。` }
+          const file = loopFilePath(cwd)
+          let loaded
+          try {
+            loaded = loadLoopDocument({ path: file, cwd })
+          } catch (error) {
+            return { kind: 'error', text: `monitor/loops.yml 读不了：${error instanceof Error ? error.message : String(error)}` }
+          }
+          if (loaded.created) writeLoopDocument(file, loaded.doc)
+          let shown = loaded.doc
+          if (parsed.path !== undefined && parsed.path !== '') {
+            const prefix = parsed.path.replace(/\/$/, '')
+            if (!loopExists(loaded.doc, prefix)) {
+              const known = listLoopNodes(loaded.doc).map(item => item.path)
+              return {
+                kind: 'error',
+                text: `loops.yml 里没有「${prefix}」。现有：${known.length === 0 ? '(只有根 loop)' : known.join(' / ')}`,
+              }
+            }
+            const within = path => path === prefix || path.startsWith(`${prefix}/`)
+            shown = {
+              ...loaded.doc,
+              nodes: (loaded.doc.nodes ?? []).filter(node => within(node.path)),
+              transitions: (loaded.doc.transitions ?? []).filter(transition => (
+                within(transition.to.loop)
+                || (transition.from !== null && transition.from !== undefined && within(transition.from.loop))
+              )),
+            }
+          }
+          const header = loaded.created
+            ? `已在 ${file} 建好 loops.yml（还是空的：结构用 monitor_loop declare 声明，转移由裁决或 monitor_loop move 写入）。\n\n`
+            : ''
+          if (parsed.json === true) return { kind: 'success', text: header + JSON.stringify(shown, null, 2) }
+          return { kind: 'success', text: header + renderLoopDocument(shown, { all: parsed.all === true }) }
         }
         const target = resolveTarget(parsed.sessionId, invocation.agent)
         if (target === undefined) {
@@ -1125,6 +1410,28 @@ export function apply(ctx, config) {
         },
         reason: { type: 'string', description: 'One sentence: which criterion decided this verdict.' },
         next_watch: { type: 'string', description: 'One sentence: what to look at next round.' },
+        loop: {
+          type: 'string',
+          description: 'Which node of the project loop tree this round advances: a path like `inbound` or `inbound/replay`; empty means the top loop (the whole development flow).',
+        },
+        state: {
+          type: 'string',
+          description: 'The state of that loop AFTER this round, one short line: what is now true, or what is blocking it. Send the same string while nothing changed; change it only when a fact changed the picture. A changed state means the previous one was wrong.',
+        },
+        updates: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'What this round actually changed, as `path#what changed` (file, gate, ledger entry). Omit when nothing was written.',
+        },
+        outcome: {
+          type: 'string',
+          enum: ['done', 'abandoned', 'blocked', 'suspended', 'progress'],
+          description: 'Lifecycle status of the node this round is leaving (only when the round moves to a different loop): done (sub-task finished) / abandoned (giving up this path) / blocked (waiting on something external) / suspended (will come back) / progress (still working inside). `abandoned` and `blocked` require `note`.',
+        },
+        note: {
+          type: 'string',
+          description: 'One-line reason for `abandoned` or `blocked` outcomes; what exactly is being abandoned or what is the block.',
+        },
       },
       required: ['target', 'verdict', 'premise', 'evidence', 'reason', 'next_watch'],
       additionalProperties: false,
@@ -1143,9 +1450,20 @@ export function apply(ctx, config) {
       const premise = String(args?.premise ?? '').trim()
       const reason = String(args?.reason ?? '').trim()
       const nextWatch = String(args?.next_watch ?? '').trim()
+      const loopPath = String(args?.loop ?? '').trim()
+      const loopState = String(args?.state ?? '').trim()
+      const updates = Array.isArray(args?.updates) ? args.updates.map(String).filter(item => item.trim() !== '') : []
+      const loopOutcome = typeof args?.outcome === 'string' ? args.outcome.trim() : ''
+      const loopNote = typeof args?.note === 'string' ? args.note.trim() : ''
+      if (loopOutcome !== '' && !LOOP_OUTCOMES.includes(loopOutcome)) {
+        return `outcome 只能是 ${LOOP_OUTCOMES.join(' | ')}，收到「${loopOutcome}」。`
+      }
+      if ((loopOutcome === 'abandoned' || loopOutcome === 'blocked') && loopNote === '') {
+        return `outcome=${loopOutcome} 必须带 note 说明原因。`
+      }
       const fingerprint = `${premise}|${evidence.join('|')}`
 
-      const record = (finalVerdict, note) => {
+      const record = (finalVerdict, verdictNote) => {
         appendReceipt(receiptsPath, {
           at: new Date().toISOString(),
           event: 'verdict',
@@ -1155,9 +1473,26 @@ export function apply(ctx, config) {
           evidence,
           reason,
           nextWatch,
-          note,
+          loop: loopPath,
+          state: loopState,
+          updates,
+          outcome: loopOutcome || undefined,
+          loopNote: loopNote || undefined,
+          note: verdictNote,
         })
-        return `已记录裁决 ${finalVerdict}（${evidence.length} 条证据）${note === undefined ? '' : `：${note}`}`
+        const advanced = advanceLoop({
+          target: targetId,
+          verdict: finalVerdict,
+          state: loopState,
+          loop: loopPath,
+          updates,
+          fact: evidence.join('；') || reason,
+          round: watcher?.ticks,
+          by: watcher?.supervisorId,
+          outcome: loopOutcome || undefined,
+          note: loopNote || undefined,
+        })
+        return `已记录裁决 ${finalVerdict}（${evidence.length} 条证据）${verdictNote === undefined ? '' : `：${verdictNote}`}${advanced}`
       }
 
       if (verdict === 'NO_NEW_EVIDENCE') {
@@ -1176,6 +1511,7 @@ export function apply(ctx, config) {
 
       const problems = []
       if (premise === '') problems.push('前提是空的')
+      if (loopState === '') problems.push('state 是空的：这一轮之后那个 loop 处于什么状态（一句话；没变就原样再写一遍）')
       if (reason === '') problems.push('理由是空的')
       if (nextWatch === '') problems.push('「下一轮盯」是空的')
       if (evidence.length === 0) problems.push('证据为空；没有新增就判 NO_NEW_EVIDENCE')
@@ -1204,6 +1540,104 @@ export function apply(ctx, config) {
         watcher.lastVerdictFingerprint = fingerprint
       }
       return record(verdict)
+    },
+  })
+
+  ctx.tools.register({
+    name: 'monitor_loop',
+    description: "Maintain the watched project's loop document (monitor/loops.yml): the structure of the development flow plus the run through it. `declare` creates a loop node (a phase like 入站/出站/部署/回滚, a step, or a trial chain pulled out after a mistake); `move` records one time-stamped transition to a new position, and when it crosses loops you must say `outcome` for the node being left; `close` marks a node finished without changing position (writes a from==to transition); `status` reads it back. Per-round movement is usually cheaper through monitor_verdict's `loop`/`state`/`outcome`.",
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['declare', 'move', 'close', 'status'], description: 'declare = create/retitle a loop node; move = record a transition; close = mark the current (or named) node as finished without changing position; status = read position, structure and recent transitions.' },
+        target: { type: 'string', description: 'Watched session id; its project owns the file.' },
+        loop: {
+          type: 'string',
+          description: 'Loop path, e.g. `inbound`, `inbound/flow/test`, `inbound/trial-401`. Empty or `.` is the top loop. A trial chain is declared under the loop that spawned it.',
+        },
+        title: { type: 'string', description: 'declare: human name for the node (e.g. 入站).' },
+        kind: { type: 'string', enum: ['phase', 'flow', 'step', 'trial'], description: 'declare: what the node is. `trial` marks a detour expected to close and return.' },
+        goal: { type: 'string', description: 'declare: what finishing this loop means (one sentence).' },
+        state: { type: 'string', description: 'move: the state of that loop after the transition, one short line.' },
+        fact: { type: 'string', description: 'move: the fact that made this transition true (evidence pointer or one line).' },
+        updates: { type: 'array', items: { type: 'string' }, description: 'move: what changed, as `path#what changed`.' },
+        outcome: {
+          type: 'string',
+          enum: ['done', 'abandoned', 'blocked', 'suspended', 'progress'],
+          description: 'move: lifecycle status of the node being LEFT when this move crosses loops (required then). close: what this node is being closed as; `progress` is not allowed for close. `abandoned` and `blocked` require `note`.',
+        },
+        note: {
+          type: 'string',
+          description: 'move/close: one-line reason, required for `abandoned` and `blocked` outcomes.',
+        },
+      },
+      required: ['action', 'target'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: String(value ?? '') }],
+    },
+    execute: (args) => {
+      const action = String(args?.action ?? '')
+      const targetId = String(args?.target ?? '')
+      const target = agentOf(targetId)
+      if (target === undefined) return `找不到会话 ${targetId}。`
+      const cwd = cwdOf(target)
+      if (cwd === undefined) return `读不到 ${targetId} 的工作目录，无法定位 monitor/loops.yml。`
+      const loop = String(args?.loop ?? '').trim()
+      const file = loopFilePath(cwd)
+      try {
+        const loaded = loadLoopDocument({ path: file, cwd })
+        const doc = loaded.doc
+        if (action === 'declare') {
+          const ensured = ensureLoopNode(doc, loop, {
+            title: typeof args?.title === 'string' ? args.title : undefined,
+            kind: NODE_KINDS.includes(args?.kind) ? args.kind : undefined,
+            goal: typeof args?.goal === 'string' ? args.goal : undefined,
+          })
+          writeLoopDocument(file, doc)
+          const node = ensured.node
+          const children = listLoopNodes(doc).filter(item => item.path.startsWith(`${ensured.path}/`))
+          const created = ensured.created.length > 0 ? `（新建 ${ensured.created.join(' / ')}）` : ''
+          return `已声明 ${ensured.path === '' ? '根 loop' : ensured.path}：${node?.title ?? ''}${node?.kind === undefined ? '' : ` · ${node.kind}`}${created}${children.length === 0 ? '' : ` · 其下 ${children.length} 个节点`}`
+        }
+        if (action === 'move') {
+          const moved = appendLoopTransition(doc, {
+            loop,
+            state: args?.state,
+            fact: typeof args?.fact === 'string' ? args.fact : undefined,
+            updates: Array.isArray(args?.updates) ? args.updates.map(String) : undefined,
+            by: watchers.get(targetId)?.supervisorId,
+            outcome: typeof args?.outcome === 'string' && args.outcome.trim() !== '' ? args.outcome.trim() : undefined,
+            note: typeof args?.note === 'string' && args.note.trim() !== '' ? args.note.trim() : undefined,
+          })
+          writeLoopDocument(file, doc)
+          const position = loopPosition(doc)
+          const from = moved.transition.from === null
+            ? '起点'
+            : `${moved.transition.from.loop === '' ? '根 loop' : moved.transition.from.loop} · ${moved.transition.from.state}`
+          const created = moved.created.length === 0 ? '' : `（新建 ${moved.created.join(' / ')}）`
+          const outcomeNote = moved.transition.outcome === undefined ? '' : ` · outcome=${moved.transition.outcome}`
+          return `已记 ${moved.kind}：${from} ⇒ ${position?.loop === '' ? '根 loop' : position?.loop} · ${position?.state ?? ''}${outcomeNote} · 累计 ${doc.transitions.length} 条转移${created}`
+        }
+        if (action === 'close') {
+          const closed = closeLoopNode(doc, {
+            loop,
+            outcome: typeof args?.outcome === 'string' ? args.outcome.trim() : '',
+            note: typeof args?.note === 'string' && args.note.trim() !== '' ? args.note.trim() : undefined,
+            fact: typeof args?.fact === 'string' ? args.fact : undefined,
+            by: watchers.get(targetId)?.supervisorId,
+          })
+          writeLoopDocument(file, doc)
+          const nodeLabel = closed.transition.from.loop === '' ? '根 loop' : closed.transition.from.loop
+          return `已关闭 ${nodeLabel}（${closed.transition.outcome}）· 位置不变 · 累计 ${doc.transitions.length} 条转移`
+        }
+        if (action === 'status') return renderLoopDocument(doc, { all: false })
+        return 'action 只能是 declare / move / close / status。'
+      } catch (error) {
+        return `写 loop 失败：${error instanceof Error ? error.message : String(error)}`
+      }
     },
   })
 

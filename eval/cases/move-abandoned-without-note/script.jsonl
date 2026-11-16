@@ -1,0 +1,6 @@
+// abandoned/blocked 必须带 note；不带就拒。
+{"op":"declare","loop":"inbound","title":"入站","kind":"phase"}
+{"op":"declare","loop":"outbound","title":"出站","kind":"phase"}
+{"op":"move","loop":"inbound","state":"未部署"}
+{"op":"move","loop":"outbound","state":"开始","outcome":"abandoned"}
+{"op":"move","loop":"outbound","state":"开始","outcome":"abandoned","note":"这条路不走了"}
